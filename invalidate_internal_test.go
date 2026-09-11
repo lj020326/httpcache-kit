@@ -88,6 +88,10 @@ func TestUnsafeRequestInvalidatesCachedGET(t *testing.T) {
 	})
 
 	h := NewHandler(NewMemoryCache(), upstream)
+	// Storing runs on a tracked background goroutine. Draining it before the
+	// test returns keeps it from reading the package-level Clock while a later
+	// test writes it.
+	t.Cleanup(func() { h.writes.Wait() })
 
 	do := func(method, target string) {
 		rec := httptest.NewRecorder()
@@ -133,6 +137,7 @@ func TestInvalidationCoversVaryVariants(t *testing.T) {
 	})
 
 	h := NewHandler(NewMemoryCache(), upstream)
+	t.Cleanup(func() { h.writes.Wait() })
 
 	get := func(lang string) {
 		req := httptest.NewRequest("GET", "http://example.org/thing", nil)
