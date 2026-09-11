@@ -4,7 +4,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestInvalidationKeys covers the key set RFC 7234 section 4.4 requires a
@@ -215,3 +217,114 @@ func TestValidateRefusesWithoutAValidator(t *testing.T) {
 type nopSeekCloser struct{ *strings.Reader }
 
 func (nopSeekCloser) Close() error { return nil }
+
+// --- Codex review round 2 (PR #5) ---
+
+// TestInvalidationSurvivesRefetchingOneVariant is the regression test for
+// propagating the base entry's boolean staleness. Refetching one variant
+// rewrites the BASE entry too, and Store used to clear the marker with it, so
+// every other pre-mutation variant became a HIT again.
+func TestInvalidationSurvivesRefetchingOneVariant(t *testing.T) {
+	var upstreamHits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", "Accept-Language")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	})
+
+	h := NewHandler(NewMemoryCache(), upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	get := func(lang string) {
+		req := httptest.NewRequest("GET", "http://example.org/thing", nil)
+		req.Header.Set("Accept-Language", lang)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		rec.Flush()
+	}
+
+	// Two variants stored.
+	get("en")
+	h.writes.Wait()
+	get("fr")
+	h.writes.Wait()
+
+	before := atomic.LoadInt32(&upstreamHits)
+	get("en")
+	get("fr")
+	if atomic.LoadInt32(&upstreamHits) != before {
+		t.Fatal("a variant was not cached")
+	}
+
+	// Mutate, then refetch only the "en" variant.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "http://example.org/thing", nil))
+	rec.Flush()
+
+	before = atomic.LoadInt32(&upstreamHits)
+	get("en")
+	if atomic.LoadInt32(&upstreamHits) == before {
+		t.Fatal("the en variant was served from cache after the POST")
+	}
+	h.writes.Wait()
+
+	// "fr" must STILL revalidate: replacing one variant does not un-invalidate
+	// the others.
+	before = atomic.LoadInt32(&upstreamHits)
+	get("fr")
+	if atomic.LoadInt32(&upstreamHits) == before {
+		t.Error("the fr variant was served from cache after the POST; refetching the en variant cleared the invalidation")
+	}
+}
+
+// TestOlderStoreCannotClearANewerInvalidation is the regression test for Store
+// deleting the stale marker. A cacheable GET whose background store was still
+// in flight when a mutation completed erased the newer invalidation and
+// republished the pre-mutation response as fresh.
+func TestOlderStoreCannotClearANewerInvalidation(t *testing.T) {
+	c := NewMemoryCache()
+
+	const key = "GET:http://example.org/thing"
+	hdr := http.Header{"Cache-Control": []string{"max-age=3600"}}
+
+	// A response that predates the invalidation, as an in-flight store would.
+	old := NewResource(http.StatusOK, nopSeekCloser{strings.NewReader("old")}, hdr.Clone())
+	old.Header().Set("Date", Clock().Add(-time.Minute).Format(http.TimeFormat))
+
+	c.Invalidate(key)
+	if err := c.Store(old, key); err != nil {
+		t.Fatalf("Store error = %v", err)
+	}
+
+	got, err := c.Retrieve(key)
+	if err != nil {
+		t.Fatalf("Retrieve error = %v", err)
+	}
+	defer func() { _ = got.Close() }()
+
+	if !got.IsStale() {
+		t.Error("a store that predates the invalidation republished the entry as fresh")
+	}
+}
+
+// TestInvalidationKeysPreserveEscapedPaths: url.Parse records "/objects/a%2Fb"
+// in RawPath and the decoded "/objects/a/b" in Path, so dropping RawPath while
+// resolving Location produced an invalidation key for a different resource
+// than the one a direct request is cached under.
+func TestInvalidationKeysPreserveEscapedPaths(t *testing.T) {
+	r := httptest.NewRequest("POST", "http://example.org/objects", nil)
+	cr, err := newCacheRequest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := cr.sameOriginURL("/objects/a%2Fb")
+	if u == nil {
+		t.Fatal("sameOriginURL returned nil for a same-origin Location")
+	}
+	if got := u.EscapedPath(); got != "/objects/a%2Fb" {
+		t.Errorf("EscapedPath = %q, want /objects/a%%2Fb -- the escaped spelling is the cache-key identity", got)
+	}
+}

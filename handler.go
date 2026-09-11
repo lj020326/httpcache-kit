@@ -716,6 +716,14 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 	}()
 }
 
+// staleAtChecker is an optional Cache capability: when a key was invalidated.
+//
+// The built-in cache implements it. A third-party Cache that does not simply
+// gets the coarser base-entry fallback in lookup.
+type staleAtChecker interface {
+	StaleAt(key string) (time.Time, bool)
+}
+
 // lookupResource finds the best matching Resource for the
 // request, or nil and ErrNotFoundInCache if none is found
 func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
@@ -746,6 +754,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 		}
 		// Whether the BASE entry was invalidated, read before it is closed.
 		baseStale := res.IsStale()
+		baseKey := req.Key.String()
 
 		varied, varyErr := h.cache.Retrieve(req.Key.Vary(vary, req.Request).String())
 		// The primary entry is not the one we serve, and nothing else will
@@ -760,14 +769,27 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 		//
 		// Invalidation marks the base GET/HEAD keys stale, but each variant is
 		// stored under its own Key.Vary(...) key, and the Cache interface
-		// cannot enumerate them. Since storeResource writes the base entry
-		// alongside every variant, and lookup reaches a variant only THROUGH
-		// that base entry, propagating staleness here covers all of them.
-		// Without it, a request whose Vary headers matched an existing variant
-		// went on being served the pre-mutation representation, with no
-		// revalidation, after a successful POST/PUT/PATCH/DELETE.
-		if baseStale && varied != nil {
-			varied.MarkStale()
+		// cannot enumerate them. Without this, a request whose Vary headers
+		// matched an existing variant went on being served the pre-mutation
+		// representation, with no revalidation, after a successful
+		// POST/PUT/PATCH/DELETE.
+		//
+		// The variant is judged against the base key's invalidation TIME, not
+		// against whether the base entry currently reads as stale. Refetching
+		// one variant rewrites the base entry too, so a boolean would make
+		// every OTHER variant fresh again as soon as the first was replaced;
+		// comparing each variant's own Date against the marker keeps it stale
+		// until it is itself replaced.
+		if varied != nil {
+			if checker, ok := h.cache.(staleAtChecker); ok {
+				if staleAt, marked := checker.StaleAt(baseKey); marked && !varied.DateAfter(staleAt) {
+					varied.MarkStale()
+				}
+			} else if baseStale {
+				// A Cache that cannot report invalidation times falls back to
+				// the base entry's own state.
+				varied.MarkStale()
+			}
 		}
 		res = varied
 	}
@@ -812,7 +834,11 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	if u.Host != "" && !strings.EqualFold(u.Host, r.Host) {
 		return nil
 	}
-	ref := r.URL.ResolveReference(&url.URL{Path: u.Path, RawQuery: u.RawQuery})
+	// RawPath is carried through: url.Parse records "/objects/a%2Fb" in
+	// RawPath and the decoded "/objects/a/b" in Path, so dropping it produced
+	// an invalidation key for a different resource than the one a direct
+	// request is cached under.
+	ref := r.URL.ResolveReference(&url.URL{Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery})
 	target := *r.URL
 	target.Path = ref.Path
 	target.RawPath = ref.RawPath

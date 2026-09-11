@@ -321,11 +321,16 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 			return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
 		}
 
-		// Remove from stale map
-		c.staleMutex.Lock()
-		delete(c.stale, key)
-		c.staleMutex.Unlock()
-
+		// The stale marker is deliberately LEFT IN PLACE.
+		//
+		// Retrieve already compares a stored response's Date against the
+		// marker, so a response written after the invalidation supersedes it
+		// without the marker having to be deleted. Deleting it here was
+		// actively wrong twice over: a store that was already in flight when a
+		// mutation completed erased the newer invalidation and republished the
+		// pre-mutation response as fresh, and refetching ONE Vary variant
+		// cleared the base marker that every OTHER variant is still judged
+		// against. The cleanup goroutine expires markers on its own.
 		hashedKey := hashKey(key)
 
 		// If Content-Length is known, make room before the write. Unknown-length
@@ -434,6 +439,19 @@ func (c *cache) Invalidate(keys ...string) {
 	for _, key := range keys {
 		c.stale[key] = now
 	}
+}
+
+// StaleAt returns when key was invalidated, if it was.
+//
+// It lets the handler judge a Vary VARIANT against the base key's marker:
+// variants live under their own keys, which invalidation cannot enumerate, so
+// without this each one would have to be reached through a base entry that a
+// single refetch makes fresh again.
+func (c *cache) StaleAt(key string) (time.Time, bool) {
+	c.staleMutex.RLock()
+	defer c.staleMutex.RUnlock()
+	t, ok := c.stale[key]
+	return t, ok
 }
 
 func (c *cache) Freshen(res *Resource, keys ...string) error {
