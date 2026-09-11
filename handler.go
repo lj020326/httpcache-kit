@@ -7,8 +7,10 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +53,14 @@ type HandlerOptions struct {
 }
 
 type Handler struct {
+	// Shared reports whether this cache is shared between users (a reverse
+	// proxy) rather than private to one (a browser-style cache).
+	//
+	// It defaults to false, which is the *private* cache profile: responses
+	// marked "Cache-Control: private" and responses to requests carrying an
+	// Authorization header are storable. Deploying a shared cache without
+	// setting this serves one user's response to another. Prefer
+	// NewSharedHandler, which cannot be forgotten.
 	Shared    bool
 	upstream  http.Handler
 	validator *Validator
@@ -69,9 +79,25 @@ type missFlight struct {
 	done chan struct{}
 }
 
-// NewHandler returns a cache handler with default options (package-level logger).
+// NewHandler returns a private cache handler with default options
+// (package-level logger). Use NewSharedHandler for a cache that is shared
+// between users, such as a reverse proxy.
 func NewHandler(cache Cache, upstream http.Handler) *Handler {
 	return NewHandlerWithOptions(cache, upstream, nil)
+}
+
+// NewSharedHandler returns a cache handler configured as a shared cache: it
+// refuses to store "Cache-Control: private" responses and responses to
+// authorized requests unless they are explicitly marked public or carry
+// s-maxage, and it strips headers listed in "private" before storing.
+//
+// This is the constructor to use for a reverse proxy. NewHandler leaves
+// Shared false, which is correct for a per-user cache and unsafe for a
+// shared one.
+func NewSharedHandler(cache Cache, upstream http.Handler) *Handler {
+	h := NewHandlerWithOptions(cache, upstream, nil)
+	h.Shared = true
+	return h
 }
 
 // NewHandlerWithOptions returns a cache handler with the given options.
@@ -602,15 +628,53 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 	}
 }
 
+// invalidateResource invalidates the cache entries that a successful unsafe
+// request has made stale, per RFC 7234 section 4.4.
+//
+// This used to only log: nothing was ever invalidated, so a resource that had
+// been POSTed to, PUT or DELETEd kept being served from cache until its own
+// freshness lifetime ran out.
 func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
+	keys := invalidationKeys(res, r)
+	if len(keys) == 0 {
+		return
+	}
 	if !h.beginWrite() {
 		return
 	}
 
 	go func() {
 		defer h.endWrite()
-		h.debugf("invalidating resource %+v", res)
+		h.cache.Invalidate(keys...)
+		h.debugf("invalidated %d key(s) after %s %s: %q", len(keys), r.Method, r.URL, keys)
 	}()
+}
+
+// invalidationKeys returns the cache keys made stale by a successful unsafe
+// request: the effective request URI, plus the URIs named by the response's
+// Location and Content-Location headers.
+//
+// Both GET and HEAD keys are invalidated, because a HEAD response may have
+// been stored separately. Cross-origin targets are ignored — a response must
+// not be able to evict another origin's entries.
+func invalidationKeys(res *Resource, r *cacheRequest) []string {
+	base := NewKey("GET", r.URL, r.Header)
+	keys := []string{base.String(), base.ForMethod("HEAD").String()}
+
+	for _, header := range []string{"Location", "Content-Location"} {
+		raw := res.Header().Get(header)
+		if raw == "" {
+			continue
+		}
+		u := r.sameOriginURL(raw)
+		if u == nil {
+			debugf("ignoring cross-origin or unparseable %s %q", header, raw)
+			continue
+		}
+		k := NewKey("GET", u, r.Header)
+		keys = append(keys, k.String(), k.ForMethod("HEAD").String())
+	}
+	return keys
 }
 
 func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func()) {
@@ -680,10 +744,15 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 			_ = res.Close()
 			return nil, ErrNotFoundInCache
 		}
-		res, err = h.cache.Retrieve(req.Key.Vary(vary, req.Request).String())
-		if err != nil {
-			return res, err
+		varied, varyErr := h.cache.Retrieve(req.Key.Vary(vary, req.Request).String())
+		// The primary entry is not the one we serve, and nothing else will
+		// close it. Releasing it here is what keeps the disk backend from
+		// leaking a file handle on every Vary lookup.
+		_ = res.Close()
+		if varyErr != nil {
+			return varied, varyErr
 		}
+		res = varied
 	}
 
 	return res, nil
@@ -712,6 +781,27 @@ func newCacheRequest(r *http.Request) (*cacheRequest, error) {
 		Time:         Clock(),
 		CacheControl: cc,
 	}, nil
+}
+
+// sameOriginURL resolves raw against the request URI and returns it only when
+// it targets the same origin, shaped so that the resulting key matches what
+// NewRequestKey would build for a direct request to that path. Returns nil for
+// an unparseable or cross-origin reference.
+func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil
+	}
+	if u.Host != "" && !strings.EqualFold(u.Host, r.Host) {
+		return nil
+	}
+	ref := r.URL.ResolveReference(&url.URL{Path: u.Path, RawQuery: u.RawQuery})
+	target := *r.URL
+	target.Path = ref.Path
+	target.RawPath = ref.RawPath
+	target.RawQuery = ref.RawQuery
+	target.Fragment = ""
+	return &target
 }
 
 func (r *cacheRequest) isStateChanging() bool {

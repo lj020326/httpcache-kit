@@ -3,6 +3,7 @@ package httpcache
 import (
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -19,28 +20,18 @@ func NewKey(method string, u *url.URL, h http.Header) Key {
 	return Key{method: method, header: h, u: *u, vary: []string{}}
 }
 
-// NewRequestKey generates a Key for a request
+// NewRequestKey generates a Key for a request.
+//
+// The key is derived from the effective request URI only. A request header
+// must never be able to choose which cache entry a response is stored under:
+// letting the *request's* Content-Location pick the key allowed a client to
+// park its own response under another URL's key ("GET /attacker-page" with
+// "Content-Location: /admin"), poisoning a shared cache for every other user.
+//
+// RFC 7234 does use Content-Location, but the *response's* — and only to
+// invalidate entries, never to select a storage key. See invalidationKeys.
 func NewRequestKey(r *http.Request) Key {
-	URL := r.URL
-
-	if location := r.Header.Get("Content-Location"); location != "" {
-		u, err := url.Parse(location)
-		if err == nil {
-			if !u.IsAbs() {
-				u = r.URL.ResolveReference(u)
-			}
-			if u.Host != r.Host {
-				debugf("illegal host %q in Content-Location", u.Host)
-			} else {
-				debugf("using Content-Location: %q", u.String())
-				URL = u
-			}
-		} else {
-			debugf("failed to parse Content-Location %q", location)
-		}
-	}
-
-	return NewKey(r.Method, URL, r.Header)
+	return NewKey(r.Method, r.URL, r.Header)
 }
 
 // ForMethod returns a new Key with a given method
@@ -61,6 +52,18 @@ func (k Key) Vary(varyHeader string, r *http.Request) Key {
 	return k2
 }
 
+// varySeparator delimits the Vary section of a key and the entries inside it.
+//
+// It is a US unit separator, chosen because it cannot appear unescaped on
+// either side of the boundary: url.URL.String percent-encodes control bytes,
+// and each Vary entry is run through strconv.Quote. That makes the encoding
+// injective — distinct (URL, Vary) pairs always produce distinct keys.
+//
+// The previous encoding used ":" and "::" as delimiters against a raw URL and
+// raw header values, so a URL containing "::" could be crafted to produce the
+// same key string as a different URL carrying Vary values.
+const varySeparator = "\x1f"
+
 func (k Key) String() string {
 	URL := canonicalURL(&k.u).String()
 	var b strings.Builder
@@ -68,12 +71,9 @@ func (k Key) String() string {
 	b.WriteString(k.method)
 	b.WriteString(":")
 	b.WriteString(URL)
-	if len(k.vary) > 0 {
-		b.WriteString("::")
-		for _, v := range k.vary {
-			b.WriteString(v)
-			b.WriteString(":")
-		}
+	for _, v := range k.vary {
+		b.WriteString(varySeparator)
+		b.WriteString(strconv.Quote(v))
 	}
 	return b.String()
 }
