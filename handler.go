@@ -639,15 +639,15 @@ func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
 	if len(keys) == 0 {
 		return
 	}
-	if !h.beginWrite() {
-		return
-	}
-
-	go func() {
-		defer h.endWrite()
-		h.cache.Invalidate(keys...)
-		h.debugf("invalidated %d key(s) after %s %s: %q", len(keys), r.Method, r.URL, keys)
-	}()
+	// Synchronously, before ServeHTTP returns.
+	//
+	// Invalidate only writes stale markers under a mutex, so there is nothing
+	// to gain by deferring it -- and deferring it left a window in which the
+	// unsafe request had already been answered while the previous
+	// representation was still considered fresh, so an immediate or concurrent
+	// GET could be served stale content after a successful mutation.
+	h.cache.Invalidate(keys...)
+	h.debugf("invalidated %d key(s) after %s %s: %q", len(keys), r.Method, r.URL, keys)
 }
 
 // invalidationKeys returns the cache keys made stale by a successful unsafe
@@ -744,6 +744,9 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 			_ = res.Close()
 			return nil, ErrNotFoundInCache
 		}
+		// Whether the BASE entry was invalidated, read before it is closed.
+		baseStale := res.IsStale()
+
 		varied, varyErr := h.cache.Retrieve(req.Key.Vary(vary, req.Request).String())
 		// The primary entry is not the one we serve, and nothing else will
 		// close it. Releasing it here is what keeps the disk backend from
@@ -751,6 +754,20 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 		_ = res.Close()
 		if varyErr != nil {
 			return varied, varyErr
+		}
+
+		// An invalidated base entry invalidates its variants.
+		//
+		// Invalidation marks the base GET/HEAD keys stale, but each variant is
+		// stored under its own Key.Vary(...) key, and the Cache interface
+		// cannot enumerate them. Since storeResource writes the base entry
+		// alongside every variant, and lookup reaches a variant only THROUGH
+		// that base entry, propagating staleness here covers all of them.
+		// Without it, a request whose Vary headers matched an existing variant
+		// went on being served the pre-mutation representation, with no
+		// revalidation, after a successful POST/PUT/PATCH/DELETE.
+		if baseStale && varied != nil {
+			varied.MarkStale()
 		}
 		res = varied
 	}

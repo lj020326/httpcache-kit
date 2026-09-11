@@ -14,10 +14,26 @@ func (v *Validator) Validate(req *http.Request, res *Resource) bool {
 	outreq := cloneRequest(req)
 	resHeaders := res.Header()
 
-	if etag := resHeaders.Get("Etag"); etag != "" {
-		outreq.Header.Set("If-None-Match", etag)
-	} else if lastMod := resHeaders.Get("Last-Modified"); lastMod != "" {
-		outreq.Header.Set("If-Modified-Since", lastMod)
+	switch {
+	case resHeaders.Get("Etag") != "":
+		outreq.Header.Set("If-None-Match", resHeaders.Get("Etag"))
+	case resHeaders.Get("Last-Modified") != "":
+		outreq.Header.Set("If-Modified-Since", resHeaders.Get("Last-Modified"))
+	default:
+		// Nothing to validate WITH.
+		//
+		// The request would otherwise go upstream unconditionally and come
+		// back with a full new body -- which this function ignores, comparing
+		// only headers. headersEqual returns true when the new response
+		// carries none of its four comparison headers, so the STORED body was
+		// served and freshened as "validated" even though the resource had
+		// changed underneath it. For an entry invalidated by a successful
+		// POST/PUT/PATCH/DELETE that is exactly the case that must not happen.
+		//
+		// Report that validation is not possible; the caller fetches the
+		// resource in full and replaces the entry.
+		debugf("no validator (ETag or Last-Modified) on the cached response; cannot revalidate")
+		return false
 	}
 
 	t := Clock()

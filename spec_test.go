@@ -58,14 +58,23 @@ func TestSpecResponseCacheControl(t *testing.T) {
 		{cacheControl: "max-age=0, no-cache", requests: 2, cacheStatus: "SKIP"},
 		{cacheControl: "max-age=0", requests: 2, cacheStatus: "SKIP"},
 		{cacheControl: "s-maxage=0", requests: 2, cacheStatus: "SKIP", shared: true},
-		{cacheControl: "s-maxage=60", requests: 2, cacheStatus: "HIT", shared: true},
+		// MISS, not HIT: s-maxage in a shared cache implies proxy-revalidate,
+		// so every hit revalidates -- and this upstream sends neither ETag nor
+		// Last-Modified, so there is nothing to revalidate WITH. The handler
+		// used to call that a successful validation by comparing headers and
+		// serve the STORED body; it now refetches. The upstream request count
+		// is unchanged, because the old path issued an unconditional request
+		// anyway and threw the response away.
+		{cacheControl: "s-maxage=60", requests: 2, cacheStatus: "MISS", shared: true},
 		{cacheControl: "s-maxage=60", requests: 2, secondsElapsed: 65, shared: true},
 		{cacheControl: "max-age=60", requests: 1, cacheStatus: "HIT"},
 		{cacheControl: "max-age=60", requests: 1, secondsElapsed: 35, cacheStatus: "HIT"},
 		{cacheControl: "max-age=60", requests: 2, secondsElapsed: 65},
-		{cacheControl: "max-age=60, must-revalidate", requests: 2, cacheStatus: "HIT"},
+		// MISS for the same reason: must-revalidate with no validator on the
+		// stored response cannot be satisfied by comparing headers.
+		{cacheControl: "max-age=60, must-revalidate", requests: 2, cacheStatus: "MISS"},
 		{cacheControl: "max-age=60, proxy-revalidate", requests: 1, cacheStatus: "HIT"},
-		{cacheControl: "max-age=60, proxy-revalidate", requests: 2, cacheStatus: "HIT", shared: true},
+		{cacheControl: "max-age=60, proxy-revalidate", requests: 2, cacheStatus: "MISS", shared: true},
 		{cacheControl: "private, max-age=60", requests: 1, cacheStatus: "HIT"},
 		{cacheControl: "private, max-age=60", requests: 2, cacheStatus: "SKIP", shared: true},
 	}
