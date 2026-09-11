@@ -418,7 +418,7 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 	c.staleMutex.RUnlock()
 
 	if exists {
-		if !res.DateAfter(staleTime) {
+		if !res.ReceivedAfter(staleTime) {
 			debugf("stale marker of %s found", staleTime)
 			res.MarkStale()
 		}
@@ -674,12 +674,41 @@ func (c *cache) Cleanup() CleanupResult {
 	return result
 }
 
+// staleRetention is how long an invalidation marker has to be kept.
+//
+// The marker is the ONLY record that entries older than it are pre-mutation,
+// so dropping it while such an entry survives republishes that entry as a HIT.
+// removeEntry already drops a marker when its entry is evicted; this covers
+// the age-based sweep, which knows nothing about what is still stored.
+//
+// StaleMapTTL alone did not: its 24 hour default against the 7 day cache TTL
+// left six days in which an infrequently requested representation -- a Vary
+// variant especially, since those are judged against the BASE key's marker and
+// may never be fetched in the meantime -- came back as fresh pre-mutation
+// content.
+//
+// With TTL disabled an entry can survive indefinitely, so markers are then
+// only removed with their entry, never by age. That trades unbounded growth of
+// one time.Time per invalidated key against serving content a mutation
+// already replaced.
+func (c *cache) staleRetention() time.Duration {
+	if c.config.TTL <= 0 {
+		return 0
+	}
+	return max(c.config.StaleMapTTL, c.config.TTL)
+}
+
 // cleanupStaleMap removes old stale map entries
 func (c *cache) cleanupStaleMap() int {
+	retention := c.staleRetention()
+	if retention <= 0 {
+		return 0
+	}
+
 	c.staleMutex.Lock()
 	defer c.staleMutex.Unlock()
 
-	cutoff := Clock().Add(-c.config.StaleMapTTL)
+	cutoff := Clock().Add(-retention)
 	removed := 0
 
 	for key, staleTime := range c.stale {

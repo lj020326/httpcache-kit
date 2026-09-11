@@ -209,6 +209,11 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	if h.needsValidation(res, cReq) {
 		if cReq.CacheControl.Has("only-if-cached") {
+			// res came from the cache and is not served; both early returns
+			// in this block leave it open otherwise, and the disk backend
+			// holds a file descriptor per retrieved resource. Every stale
+			// entry lacking a validator took one on each refresh.
+			_ = res.Close()
 			http.Error(rw, "key was in cache, but required validation",
 				http.StatusGatewayTimeout)
 			return
@@ -220,6 +225,7 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			_ = h.cache.Freshen(res, cReq.Key.String())
 		} else {
 			h.debugf("response is changed")
+			_ = res.Close()
 			h.passUpstream(rw, cReq, nil)
 			return
 		}
@@ -840,6 +846,14 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	// request is cached under.
 	ref := r.URL.ResolveReference(&url.URL{Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery})
 	target := *r.URL
+	// The scheme is part of the cache key, so an absolute target naming one
+	// must keep it. Cloning r.URL wholesale turned "Location:
+	// https://example.org/item" into a key for http://example.org/item --
+	// invalidating an unrelated entry while the representation the origin
+	// actually named stayed fresh.
+	if u.Scheme != "" {
+		target.Scheme = u.Scheme
+	}
 	target.Path = ref.Path
 	target.RawPath = ref.RawPath
 	target.RawQuery = ref.RawQuery
@@ -970,11 +984,31 @@ func (rw *responseStreamer) WriteHeader(status int) {
 	})
 }
 
+// Write implements http.ResponseWriter.
+//
+// It calls WriteHeader(StatusOK) first, as the interface requires: "If
+// WriteHeader has not yet been called, Write calls WriteHeader(http.StatusOK)
+// before writing the data."
+//
+// Without that, an upstream handler that only calls Write -- the ordinary way
+// to answer with 200 -- hung the request FOREVER. C was never closed, so
+// passUpstream sat in WaitHeaders and never reached the code that drains the
+// pipe, while the upstream goroutine blocked in this very call writing into a
+// pipe with no reader. Every test in this package happened to call WriteHeader
+// explicitly, so nothing caught it.
 func (rw *responseStreamer) Write(b []byte) (int, error) {
+	rw.WriteHeader(http.StatusOK)
 	return io.MultiWriter(rw.pipeWriter, rw.ResponseWriter).Write(b)
 }
 
+// Close finishes the upstream response.
+//
+// It signals the headers too, for the same reason Write does: a handler that
+// returns without writing anything at all still produced a 200, exactly as
+// net/http would send one, and WaitHeaders would otherwise block on a response
+// that is never coming.
 func (rw *responseStreamer) Close() error {
+	rw.WriteHeader(http.StatusOK)
 	return rw.pipeWriter.Close()
 }
 

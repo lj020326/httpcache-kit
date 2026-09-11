@@ -1006,3 +1006,154 @@ func TestHandlerShutdownDrainsWrites(t *testing.T) {
 		t.Fatalf("Shutdown after releasing store: %v", err)
 	}
 }
+
+// closeCountingBody is a ReadSeekCloser that records how often it was closed.
+type closeCountingBody struct {
+	*bytes.Reader
+	closes int32
+}
+
+func (b *closeCountingBody) Close() error { atomic.AddInt32(&b.closes, 1); return nil }
+
+// staleResourceCache always hands back one caller-supplied resource. Store and
+// the rest go to a real cache, which drains the upstream stream -- a Store
+// that ignores its body deadlocks passUpstream against its own writer.
+type staleResourceCache struct {
+	Cache
+	res *Resource
+}
+
+func (c *staleResourceCache) Header(string) (Header, error) {
+	return Header{Header: c.res.Header(), StatusCode: c.res.Status()}, nil
+}
+func (c *staleResourceCache) Retrieve(string) (*Resource, error) { return c.res, nil }
+
+// TestRefetchWithoutValidatorClosesTheCachedResource is the regression test for
+// the early return added when a stale entry has neither ETag nor
+// Last-Modified. ServeHTTP goes straight to passUpstream and returns, skipping
+// the res.Close() at the end of the function -- so the disk backend held one
+// more file descriptor for every such refresh, and repeated expiry or
+// invalidation walked the process into its open-file limit.
+func TestRefetchWithoutValidatorClosesTheCachedResource(t *testing.T) {
+	body := &closeCountingBody{Reader: bytes.NewReader([]byte("cached"))}
+	// Stale, and nothing to revalidate WITH.
+	res := NewResource(http.StatusOK, body, http.Header{
+		"Cache-Control": {"max-age=0, must-revalidate"},
+		"Date":          {Clock().Format(http.TimeFormat)},
+	})
+
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		_, _ = w.Write([]byte("fresh"))
+	})
+	h := NewHandler(&staleResourceCache{Cache: NewMemoryCache(), res: res}, upstream)
+	// storeResource runs in the background; without this it outlives the test
+	// and races the next one's Clock reassignment.
+	t.Cleanup(func() { h.writes.Wait() })
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://example.org/x", nil))
+
+	if got := rec.Body.String(); got != "fresh" {
+		t.Fatalf("body = %q, want the refetched %q", got, "fresh")
+	}
+	if atomic.LoadInt32(&body.closes) == 0 {
+		t.Error("the cached resource was not closed before the full refetch")
+	}
+}
+
+// TestSupersedingIsJudgedByLocalReceiveTime is the regression test for
+// deciding whether a stored response supersedes an invalidation from the
+// ORIGIN's Date header. A replacement carrying no Date -- which a direct
+// http.Handler upstream may well omit -- never satisfied it, so the key stayed
+// stale on every retrieval and was refetched until the marker was swept.
+func TestSupersedingIsJudgedByLocalReceiveTime(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	defer func() { _ = c.Close() }()
+
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("before"), http.Header{}), "k"); err != nil {
+		t.Fatal(err)
+	}
+	c.Invalidate("k")
+
+	// The replacement arrives a minute later with NO origin Date -- only the
+	// Proxy-Date the handler stamps from the local clock on receipt.
+	now = now.Add(time.Minute)
+	replacement := NewResourceBytes(http.StatusOK, []byte("after"), http.Header{
+		ProxyDateHeader: {Clock().Format(http.TimeFormat)},
+	})
+	if err := c.Store(replacement, "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.Retrieve("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = got.Close() }()
+	if got.IsStale() {
+		t.Error("a replacement stored after the invalidation was still marked stale; it carried no origin Date")
+	}
+}
+
+// TestUpstreamWithoutExplicitWriteHeaderDoesNotHang is the regression test for
+// responseStreamer.Write not implying WriteHeader(StatusOK).
+//
+// http.ResponseWriter requires it, and an upstream that just writes a body --
+// the ordinary way to answer 200 -- relied on it. Without it C was never
+// closed, so passUpstream waited in WaitHeaders and never reached the code
+// that drains the pipe, while the upstream goroutine blocked in Write against
+// a pipe with no reader. The request hung forever. Every other test in this
+// package calls WriteHeader explicitly, which is why nothing caught it.
+func TestUpstreamWithoutExplicitWriteHeaderDoesNotHang(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		upstream http.HandlerFunc
+		want     int
+		wantBody string
+	}{
+		{
+			name: "writes a body without WriteHeader",
+			upstream: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", "max-age=60")
+				_, _ = w.Write([]byte("ok"))
+			},
+			want:     http.StatusOK,
+			wantBody: "ok",
+		},
+		{
+			name:     "writes nothing at all",
+			upstream: func(http.ResponseWriter, *http.Request) {},
+			want:     http.StatusOK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHandler(NewMemoryCache(), tc.upstream)
+			t.Cleanup(func() { h.writes.Wait() })
+
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest("GET", "http://example.org/x", nil))
+				done <- rec
+			}()
+
+			select {
+			case rec := <-done:
+				if rec.Code != tc.want {
+					t.Errorf("status = %d, want %d", rec.Code, tc.want)
+				}
+				if got := rec.Body.String(); got != tc.wantBody {
+					t.Errorf("body = %q, want %q", got, tc.wantBody)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the request never completed; Write must imply WriteHeader(StatusOK)")
+			}
+		})
+	}
+}

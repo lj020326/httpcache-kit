@@ -328,3 +328,70 @@ func TestInvalidationKeysPreserveEscapedPaths(t *testing.T) {
 		t.Errorf("EscapedPath = %q, want /objects/a%%2Fb -- the escaped spelling is the cache-key identity", got)
 	}
 }
+
+// TestInvalidationKeysPreserveTargetScheme is the regression test for cloning
+// r.URL wholesale. The scheme is part of the cache key, so an absolute
+// same-host target naming another scheme produced a key for the REQUEST's
+// scheme: "Location: https://example.org/item" invalidated
+// http://example.org/item and left the representation the origin actually
+// named fresh.
+func TestInvalidationKeysPreserveTargetScheme(t *testing.T) {
+	r := httptest.NewRequest("POST", "http://example.org/objects", nil)
+	cr, err := newCacheRequest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := cr.sameOriginURL("https://example.org/item")
+	if u == nil {
+		t.Fatal("sameOriginURL returned nil for a same-host Location")
+	}
+	if u.Scheme != "https" {
+		t.Errorf("scheme = %q, want https -- the target named it explicitly", u.Scheme)
+	}
+
+	// A relative target still inherits the request's scheme.
+	if rel := cr.sameOriginURL("/item"); rel == nil || rel.Scheme != "http" {
+		t.Errorf("relative target scheme = %v, want http", rel)
+	}
+}
+
+// TestStaleMarkerOutlivesTheEntriesItJudges is the regression test for sweeping
+// invalidation markers on StaleMapTTL alone. The marker is the only record
+// that entries older than it are pre-mutation, so with the 24 hour default
+// against a 7 day cache TTL an infrequently requested representation came back
+// as a fresh HIT for the six days after its marker was swept.
+func TestStaleMarkerOutlivesTheEntriesItJudges(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	config := DefaultCacheConfig(). // TTL 7 days, StaleMapTTL 24 hours
+					WithCleanupInterval(0)
+	c := NewMemoryCacheWithConfig(config)
+	defer func() { _ = c.Close() }()
+
+	res := NewResourceBytes(http.StatusOK, []byte("before"), http.Header{})
+	if err := c.Store(res, "testkey"); err != nil {
+		t.Fatal(err)
+	}
+	c.Invalidate("testkey")
+
+	// Two days on: past StaleMapTTL, nowhere near the entry's TTL.
+	now = now.Add(48 * time.Hour)
+	c.Cleanup()
+
+	if got := c.Stats().StaleCount; got != 1 {
+		t.Fatalf("stale markers after cleanup = %d, want 1; the entry it judges lives for 7 days", got)
+	}
+
+	got, err := c.Retrieve("testkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = got.Close() }()
+	if !got.IsStale() {
+		t.Error("the pre-mutation entry came back fresh; its invalidation marker was swept out from under it")
+	}
+}

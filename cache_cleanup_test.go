@@ -100,8 +100,15 @@ func TestStaleMapCleanup(t *testing.T) {
 	now := time.Now().UTC()
 	httpcache.Clock = func() time.Time { return now }
 
-	// Create a cache with short stale map TTL
+	// Create a cache with short stale map TTL.
+	//
+	// The item TTL is short too, and has to be: a marker is now kept for at
+	// least as long as an entry it could still apply to can survive, so
+	// leaving TTL at the 7 day default would (correctly) hold the marker for
+	// seven days regardless of StaleMapTTL. See
+	// TestStaleMarkerOutlivesTheEntriesItJudges.
 	config := httpcache.DefaultCacheConfig().
+		WithTTL(30 * time.Minute).
 		WithStaleMapTTL(1 * time.Hour).
 		WithCleanupInterval(0) // Disable automatic cleanup
 

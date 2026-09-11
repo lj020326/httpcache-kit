@@ -140,6 +140,34 @@ func (r *Resource) DateAfter(d time.Time) bool {
 	return false
 }
 
+// ReceivedAfter reports whether this response reached the cache after d.
+//
+// It reads Proxy-Date, which the handler stamps from the LOCAL clock the
+// moment the upstream response arrives, and only falls back to the origin's
+// Date for a response stored without one.
+//
+// Deciding this from Date alone was wrong in both directions. A response that
+// carries no Date at all -- which a direct http.Handler upstream may well
+// omit -- never counted as superseding anything, so an invalidated key stayed
+// stale on every retrieval and was refetched until the marker was swept. An
+// origin whose clock trails the cache's did the same. Proxy-Date is always
+// present and always this machine's clock.
+//
+// Receive time, not store time: an older store still in flight when a
+// mutation lands carries a Proxy-Date from BEFORE the invalidation, so the
+// marker still wins and the pre-mutation body is not republished as fresh.
+//
+// Both stamps are HTTP dates, so this is second-granular: a replacement that
+// arrives in the same second as the invalidation does not count as
+// superseding it and is refetched once more. That is the safe direction to
+// round in.
+func (r *Resource) ReceivedAfter(d time.Time) bool {
+	if t, err := timeHeader(ProxyDateHeader, r.header); err == nil {
+		return t.After(d)
+	}
+	return r.DateAfter(d)
+}
+
 // Calculate the age of the resource
 func (r *Resource) Age() (time.Duration, error) {
 	var age time.Duration
