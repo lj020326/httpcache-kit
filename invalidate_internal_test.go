@@ -480,6 +480,19 @@ func (c plainCache) Freshen(res *Resource, keys ...string) error {
 	return c.inner.Freshen(res, keys...)
 }
 
+// impreciseCache models an existing third-party Cache implementation. It does
+// not implement StaleAt and its Resources do not carry the optional
+// full-precision storedAt value introduced by the built-in cache.
+type impreciseCache struct{ plainCache }
+
+func (c impreciseCache) Retrieve(key string) (*Resource, error) {
+	res, err := c.inner.Retrieve(key)
+	if res != nil {
+		res.SetStoredAt(time.Time{})
+	}
+	return res, err
+}
+
 // TestInvalidationSurvivesForACacheWithoutStaleAt is the regression test for
 // falling back to the base ENTRY's state when a Cache cannot report
 // invalidation times. Refetching one variant rewrites the base entry, so every
@@ -555,6 +568,54 @@ func TestInvalidationSurvivesForACacheWithoutStaleAt(t *testing.T) {
 	}
 }
 
+// TestThirdPartyVariantValidationUsesPreciseHandlerTime covers a Cache that
+// cannot attach a full-precision storedAt value to returned Resources. HTTP
+// Date and Proxy-Date carry only seconds, so a mutation and successful Vary
+// validation within one second otherwise make the variant revalidate forever.
+func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC().Truncate(time.Second).Add(100 * time.Millisecond)
+	Clock = func() time.Time { return now }
+
+	var upstreamHits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", "Accept-Language")
+		w.Header().Set("ETag", `"v1"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	})
+
+	h := NewHandler(impreciseCache{plainCache{inner: NewMemoryCache()}}, upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+	get := func() {
+		req := httptest.NewRequest("GET", "http://example.org/thing", nil)
+		req.Header.Set("Accept-Language", "en")
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	get()
+	h.writes.Wait()
+	now = now.Add(100 * time.Millisecond)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "http://example.org/thing", nil))
+	now = now.Add(100 * time.Millisecond) // same HTTP-date second, but after the marker
+
+	before := atomic.LoadInt32(&upstreamHits)
+	get() // one conditional validation
+	if atomic.LoadInt32(&upstreamHits) == before {
+		t.Fatal("the invalidated third-party-cache variant was served without validation")
+	}
+
+	before = atomic.LoadInt32(&upstreamHits)
+	get()
+	get()
+	if got := atomic.LoadInt32(&upstreamHits) - before; got != 0 {
+		t.Errorf("%d further upstream request(s) after validation, want 0", got)
+	}
+}
+
 // --- Codex review round 5 (PR #5) ---
 
 // TestSupersededStoreIsNotCached is the regression test for retaining a
@@ -576,6 +637,7 @@ func TestSupersededStoreIsNotCached(t *testing.T) {
 	defer func() { _ = c.Close() }()
 
 	const key = "GET:http://example.org/thing"
+	const variantKey = "GET:http://example.org/thing\x00vary\x00Accept-Language=\"en\""
 
 	// Received a minute ago; the mutation happens now.
 	stale := NewResourceBytes(http.StatusOK, []byte("before"), http.Header{
@@ -583,11 +645,13 @@ func TestSupersededStoreIsNotCached(t *testing.T) {
 	})
 	c.Invalidate(key)
 
-	if err := c.Store(stale, key); err != nil {
+	if err := c.Store(stale, key, variantKey); err != nil {
 		t.Fatalf("Store error = %v", err)
 	}
-	if _, err := c.Retrieve(key); err != ErrNotFoundInCache {
-		t.Errorf("Retrieve = %v, want ErrNotFoundInCache; a superseded response was cached", err)
+	for _, storedKey := range []string{key, variantKey} {
+		if _, err := c.Retrieve(storedKey); err != ErrNotFoundInCache {
+			t.Errorf("Retrieve(%q) = %v, want ErrNotFoundInCache; part of a superseded multi-key response was cached", storedKey, err)
+		}
 	}
 
 	// A replacement received AFTER the mutation is stored normally.
@@ -605,6 +669,58 @@ func TestSupersededStoreIsNotCached(t *testing.T) {
 	defer func() { _ = got.Close() }()
 	if got.IsStale() {
 		t.Error("the replacement was marked stale")
+	}
+}
+
+// TestFreshenTimestampSurvivesDiskRestart covers the full-precision local
+// generation being updated only in the in-memory LRU. A successful validation
+// does not rewrite the body, so a restart reconstructed storedAt from the old
+// body mtime and made the already-validated entry stale again.
+func TestFreshenTimestampSurvivesDiskRestart(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC().Truncate(time.Second).Add(100 * time.Millisecond)
+	Clock = func() time.Time { return now }
+
+	dir := t.TempDir()
+	const key = "GET:http://example.org/revalidated"
+	hdr := http.Header{
+		"Cache-Control": {"max-age=3600"},
+		"ETag":          {`"v1"`},
+	}
+
+	first, err := NewDiskCacheWithConfig(dir, DefaultCacheConfig().WithCleanupInterval(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Store(NewResourceBytes(http.StatusOK, []byte("body"), hdr.Clone()), key); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(100 * time.Millisecond)
+	first.Invalidate(key)
+	now = now.Add(100 * time.Millisecond) // deliberately still the same HTTP-date second
+	validated := NewResourceBytes(http.StatusOK, nil, hdr.Clone())
+	validated.RequestTime = now
+	if err := first.Freshen(validated, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := NewDiskCacheWithConfig(dir, DefaultCacheConfig().WithCleanupInterval(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+	got, err := second.Retrieve(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = got.Close() }()
+	if got.IsStale() {
+		t.Error("a successfully revalidated entry became stale again after disk-cache restart")
 	}
 }
 

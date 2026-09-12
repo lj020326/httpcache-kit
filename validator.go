@@ -48,6 +48,10 @@ func (v *Validator) Validate(req *http.Request, res *Resource) bool {
 	if headersEqual(resHeaders, resp.Header()) {
 		res.header = resp.Header()
 		res.header.Set(ProxyDateHeader, Clock().Format(http.TimeFormat))
+		// Preserve a full-precision local ordering point. Freshen uses it to
+		// reject a validation that began before a concurrent mutation, rather
+		// than treating its later header write as a newer representation.
+		res.RequestTime = t
 		return true
 	}
 

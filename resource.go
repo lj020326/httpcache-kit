@@ -188,6 +188,13 @@ func (r *Resource) StoredAfter(d time.Time) bool {
 }
 
 func (r *Resource) ReceivedAfter(d time.Time) bool {
+	// For a live upstream response, RequestTime is the precise local instant
+	// at which the fetch or validation began. It is deliberately preferred to
+	// the later write time: a request already in flight when a mutation lands
+	// must not publish its possibly pre-mutation body afterwards.
+	if !r.RequestTime.IsZero() {
+		return r.RequestTime.After(d)
+	}
 	if t, err := timeHeader(ProxyDateHeader, r.header); err == nil {
 		return t.After(d)
 	}

@@ -31,6 +31,11 @@ const (
 	headerPrefix = "header/"
 	bodyPrefix   = "body/"
 	formatPrefix = "v1/"
+
+	// storedAtHeader persists the cache's full-precision local write or
+	// validation time in the on-disk header record. It is removed before a
+	// Header or Resource is returned, so it never reaches callers.
+	storedAtHeader = "X-Httpcache-Internal-Stored-At"
 )
 
 // Returned when a resource doesn't exist
@@ -97,6 +102,13 @@ type cacheEntry struct {
 type cache struct {
 	fs     vfs.VFS
 	config *CacheConfig
+
+	// generationMu orders complete stores/freshens against invalidations.
+	// A writer that started before a mutation must finish before the marker is
+	// installed; one that starts afterwards sees the marker before touching
+	// any key. This closes the check-to-write window without holding the stale
+	// map mutex over filesystem I/O.
+	generationMu sync.RWMutex
 
 	// stale map with mutex protection
 	stale      map[string]time.Time
@@ -211,11 +223,12 @@ func (c *cache) scanExistingCache() error {
 	bodyDir := bodyPrefix + formatPrefix
 	if err := c.scanDirectory(bodyDir, func(hashedKey string, info os.FileInfo) {
 		// Create entry for this cached item
+		storedAt := info.ModTime()
 		entry := &cacheEntry{
 			key:        hashedKey, // We don't have the original key, use hashed key
 			hashedKey:  hashedKey,
 			size:       info.Size(),
-			storedAt:   info.ModTime(),
+			storedAt:   storedAt,
 			accessedAt: info.ModTime(),
 		}
 
@@ -223,6 +236,14 @@ func (c *cache) scanExistingCache() error {
 		headerPath := headerPrefix + formatPrefix + hashedKey
 		if headerInfo, err := c.fs.Stat(headerPath); err == nil {
 			entry.size += headerInfo.Size()
+			// Freshen does not rewrite the body, so its mtime cannot carry the
+			// new validation generation across a restart. Prefer the timestamp
+			// persisted in the header and retain the body mtime only for cache
+			// records written by older versions.
+			if _, persistedAt, readErr := c.readHeaderFile(headerPath, hashedKey); readErr == nil && !persistedAt.IsZero() {
+				entry.storedAt = persistedAt
+				entry.accessedAt = persistedAt
+			}
 		}
 
 		// Add to LRU tracking
@@ -288,20 +309,37 @@ func (c *cache) vfsWrite(path string, r io.Reader) (int64, error) {
 // Retrieve the Status and Headers for a given key path
 func (c *cache) Header(key string) (Header, error) {
 	path := headerPrefix + formatPrefix + hashKey(key)
+	h, _, err := c.readHeaderFile(path, key)
+	return h, err
+}
+
+// readHeaderFile reads a stored response header and extracts the cache's
+// private full-precision timestamp. The private field is deleted before the
+// Header is returned so it cannot leak into a served response or participate
+// in HTTP header comparisons.
+func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	f, err := c.fs.Open(path)
 	if err != nil {
 		if vfs.IsNotExist(err) {
-			return Header{}, ErrNotFoundInCache
+			return Header{}, time.Time{}, ErrNotFoundInCache
 		}
-		return Header{}, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, fmt.Errorf("failed to open header file %q for key %q: %w", path, key, err)
 	}
 	defer func() { _ = f.Close() }()
 
 	h, err := readHeaders(bufio.NewReader(f))
 	if err != nil {
-		return Header{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
+		return Header{}, time.Time{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
-	return h, nil
+
+	var storedAt time.Time
+	if raw := h.Header.Get(storedAtHeader); raw != "" {
+		if parsed, parseErr := time.Parse(time.RFC3339Nano, raw); parseErr == nil {
+			storedAt = parsed
+		}
+		h.Header.Del(storedAtHeader)
+	}
+	return h, storedAt, nil
 }
 
 // Store a resource against a number of keys. Resource bodies are streamed
@@ -313,6 +351,24 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 		return nil
 	}
 
+	// Make the stale check and every write one ordered operation relative to
+	// Invalidate. Checking a marker and then releasing the lock before body or
+	// header I/O left a window in which a mutation could land, after which the
+	// older response was still written and tracked as newer.
+	c.generationMu.RLock()
+	defer c.generationMu.RUnlock()
+
+	// A multi-key store is all-or-nothing with respect to invalidation. Vary
+	// responses contain the governing base key followed by a variant key. If
+	// the base marker supersedes the response, continuing to the unmarked
+	// variant publishes the same pre-mutation body under that second key.
+	for _, key := range keys {
+		if staleTime, marked := c.StaleAt(key); marked && !res.ReceivedAfter(staleTime) {
+			debugf("not storing %q: response superseded by the invalidation at %s", keys, staleTime)
+			return nil
+		}
+	}
+
 	expectedSize, hasExpectedSize := int64(0), false
 	if rawLength := res.Header().Get("Content-Length"); rawLength != "" {
 		length, err := strconv.ParseInt(rawLength, 10, 64)
@@ -322,20 +378,6 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 	}
 
 	for _, key := range keys {
-		// A response the marker already supersedes is not stored at all.
-		//
-		// It would be served stale anyway, and storing it is what made marker
-		// retention unsolvable: a GET received BEFORE a mutation whose
-		// background Store lands after it has a Proxy-Date older than the
-		// marker but a storedAt that is newer, so it outlives
-		// markerTime + TTL and became a fresh HIT once cleanup removed the
-		// marker. Skipping it means every stored entry either predates the
-		// marker -- and is evicted before it -- or supersedes it.
-		if staleTime, marked := c.StaleAt(key); marked && !res.ReceivedAfter(staleTime) {
-			debugf("not storing %s: superseded by the invalidation at %s", key, staleTime)
-			continue
-		}
-
 		if _, err := res.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
 		}
@@ -375,13 +417,14 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 			c.evictIfNeeded(written)
 		}
 
-		headerBytes, err := c.storeHeader(res.Status(), res.Header(), key)
+		storedAt := Clock()
+		headerBytes, err := c.storeHeader(res.Status(), res.Header(), key, storedAt)
 		if err != nil {
 			return err
 		}
 
 		// Update LRU tracking
-		c.trackEntry(key, hashedKey, written+headerBytes)
+		c.trackEntry(key, hashedKey, written+headerBytes, storedAt)
 	}
 
 	return nil
@@ -395,10 +438,15 @@ func (c *cache) storeBody(r io.Reader, key string) (int64, error) {
 	return n, nil
 }
 
-func (c *cache) storeHeader(code int, h http.Header, key string) (int64, error) {
+func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.Time) (int64, error) {
+	storedHeader := h.Clone()
+	if storedHeader == nil {
+		storedHeader = make(http.Header)
+	}
+	storedHeader.Set(storedAtHeader, storedAt.UTC().Format(time.RFC3339Nano))
 	hb := &bytes.Buffer{}
 	fmt.Fprintf(hb, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
-	if err := headersToWriter(h, hb); err != nil {
+	if err := headersToWriter(storedHeader, hb); err != nil {
 		return 0, fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
 	}
 	n, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(hb.Bytes()))
@@ -420,7 +468,7 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 		}
 		return nil, fmt.Errorf("failed to open body file %q for key %q: %w", bodyPath, key, err)
 	}
-	h, err := c.Header(key)
+	h, persistedAt, err := c.readHeaderFile(headerPrefix+formatPrefix+hashedKey, key)
 	if err != nil {
 		_ = f.Close()
 		if err == ErrNotFoundInCache {
@@ -430,7 +478,10 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 		return nil, fmt.Errorf("failed to retrieve header for key %q: %w", key, err)
 	}
 	res := NewResource(h.StatusCode, f, h.Header)
-	res.SetStoredAt(c.entryStoredAt(hashedKey))
+	if persistedAt.IsZero() {
+		persistedAt = c.entryStoredAt(hashedKey)
+	}
+	res.SetStoredAt(persistedAt)
 
 	// Check stale map with proper locking
 	c.staleMutex.RLock()
@@ -453,13 +504,16 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 
 func (c *cache) Invalidate(keys ...string) {
 	debugf("invalidating %q", keys)
+	c.generationMu.Lock()
+	defer c.generationMu.Unlock()
+
 	c.staleMutex.Lock()
+	defer c.staleMutex.Unlock()
 	now := Clock()
 	for _, key := range keys {
 		c.stale[key] = now
 	}
 	snapshot := c.snapshotStaleLocked()
-	c.staleMutex.Unlock()
 
 	// Written through to the backing store, so a restart does not lose it.
 	//
@@ -467,6 +521,10 @@ func (c *cache) Invalidate(keys ...string) {
 	// a mutation, and scanExistingCache restores those entries. Keeping the
 	// map in memory alone meant every deploy or crash republished the
 	// pre-mutation representation -- Vary variants included -- as a fresh HIT.
+	// Keep staleMutex held through persistence. Otherwise two invalidations
+	// can snapshot in the right order but finish their writes in the opposite
+	// order, allowing the older snapshot to erase the newer marker (or two
+	// O_TRUNC writes to corrupt the file).
 	c.persistStale(snapshot)
 }
 
@@ -484,7 +542,9 @@ func (c *cache) snapshotStaleLocked() map[string]time.Time {
 	return out
 }
 
-// persistStale writes the markers to the backing store.
+// persistStale writes the markers to the backing store. Callers hold
+// staleMutex across this call, which serialises complete snapshots through
+// their file write instead of merely serialising map access.
 //
 // Failures are logged, not returned: the in-memory markers are already
 // correct, so the mutation this accompanies has still been honoured for the
@@ -543,22 +603,49 @@ func (c *cache) StaleAt(key string) (time.Time, bool) {
 }
 
 func (c *cache) Freshen(res *Resource, keys ...string) error {
-	for _, key := range keys {
-		if h, err := c.Header(key); err == nil {
-			if h.StatusCode == res.Status() && headersEqual(h.Header, res.Header()) {
-				debugf("freshening key %s", key)
-				if _, err := c.storeHeader(h.StatusCode, res.Header(), key); err != nil {
-					return fmt.Errorf("failed to freshen header for key %q: %w", key, err)
-				}
-				// The entry has just been validated against the origin, so
-				// its store time is now. Without this the LRU still held the
-				// PRE-invalidation time and the entry stayed stale.
-				c.markFreshened(hashKey(key))
-			} else {
-				debugf("freshen failed, invalidating %s", key)
-				c.Invalidate(key)
+	var invalidate []string
+	err := func() error {
+		c.generationMu.RLock()
+		defer c.generationMu.RUnlock()
+
+		// Validation that started before a mutation must not freshen the old
+		// body after that mutation. Validator records the precise local request
+		// time on the Resource; older resources fall back to HTTP timestamps.
+		for _, key := range keys {
+			if staleTime, marked := c.StaleAt(key); marked && !res.ReceivedAfter(staleTime) {
+				return fmt.Errorf("validation for key %q was superseded by invalidation at %s", key, staleTime)
 			}
 		}
+
+		for _, key := range keys {
+			if h, headerErr := c.Header(key); headerErr == nil {
+				if h.StatusCode == res.Status() && headersEqual(h.Header, res.Header()) {
+					debugf("freshening key %s", key)
+					freshenedAt := Clock()
+					if _, writeErr := c.storeHeader(h.StatusCode, res.Header(), key, freshenedAt); writeErr != nil {
+						return fmt.Errorf("failed to freshen header for key %q: %w", key, writeErr)
+					}
+					// The entry has just been validated against the origin, so
+					// its full-precision generation is updated in memory and in
+					// the stored header used after a disk-cache restart.
+					c.markFreshened(hashKey(key), freshenedAt)
+				} else {
+					debugf("freshen failed, invalidating %s", key)
+					invalidate = append(invalidate, key)
+				}
+			}
+		}
+		return nil
+	}()
+	if err != nil {
+		return err
+	}
+
+	// Do not try to upgrade generationMu from a read lock inside the loop.
+	// Invalidate takes its write side, so mismatched entries are handled only
+	// after the ordered freshen operation has completed.
+	if len(invalidate) > 0 {
+		c.Invalidate(invalidate...)
 	}
 	return nil
 }
@@ -610,19 +697,21 @@ func headersToWriter(h http.Header, w io.Writer) error {
 // LRU tracking methods
 
 // trackEntry adds or updates an entry in the LRU index
-func (c *cache) trackEntry(key, hashedKey string, size int64) {
+func (c *cache) trackEntry(key, hashedKey string, size int64, storedAt time.Time) {
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
-	now := Clock()
+	if storedAt.IsZero() {
+		storedAt = Clock()
+	}
 
 	// Check if entry already exists
 	if entry, exists := c.lruIndex[hashedKey]; exists {
 		// Update existing entry
 		c.totalSize -= entry.size
 		entry.size = size
-		entry.storedAt = now
-		entry.accessedAt = now
+		entry.storedAt = storedAt
+		entry.accessedAt = storedAt
 		c.totalSize += size
 		// Move to front of LRU list
 		c.lruList.MoveToFront(entry.element)
@@ -632,8 +721,8 @@ func (c *cache) trackEntry(key, hashedKey string, size int64) {
 			key:        key,
 			hashedKey:  hashedKey,
 			size:       size,
-			storedAt:   now,
-			accessedAt: now,
+			storedAt:   storedAt,
+			accessedAt: storedAt,
 		}
 		entry.element = c.lruList.PushFront(entry)
 		c.lruIndex[hashedKey] = entry
@@ -658,14 +747,13 @@ func (c *cache) entryStoredAt(hashedKey string) time.Time {
 // Only the timestamps: the size is unchanged by a freshen, and writing the
 // header's length over it would corrupt the total the size cap is enforced
 // against.
-func (c *cache) markFreshened(hashedKey string) {
+func (c *cache) markFreshened(hashedKey string, freshenedAt time.Time) {
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
 	if entry, exists := c.lruIndex[hashedKey]; exists {
-		now := Clock()
-		entry.storedAt = now
-		entry.accessedAt = now
+		entry.storedAt = freshenedAt
+		entry.accessedAt = freshenedAt
 		c.lruList.MoveToFront(entry.element)
 	}
 }
@@ -849,9 +937,11 @@ func (c *cache) cleanupStaleMap() int {
 
 	if removed > 0 {
 		// Written through, like Invalidate: otherwise a restart would restore
-		// markers this sweep has just decided are no longer needed.
+		// markers this sweep has just decided are no longer needed. Persistence
+		// happens while staleMutex is held, so a newer snapshot cannot be
+		// overtaken by this older one.
 		snapshot := c.snapshotStaleLocked()
-		defer c.persistStale(snapshot)
+		c.persistStale(snapshot)
 	}
 
 	return removed
@@ -960,6 +1050,9 @@ func (c *cache) Stats() CacheStats {
 
 // Purge removes all cached items
 func (c *cache) Purge() error {
+	c.generationMu.Lock()
+	defer c.generationMu.Unlock()
+
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
@@ -974,8 +1067,8 @@ func (c *cache) Purge() error {
 	// Clear stale map, in the backing store too: leaving the file behind
 	// would restore markers for entries this call just removed.
 	c.staleMutex.Lock()
+	defer c.staleMutex.Unlock()
 	c.stale = make(map[string]time.Time)
-	c.staleMutex.Unlock()
 	if err := c.fs.Remove(staleMapPath); err != nil && !vfs.IsNotExist(err) {
 		debugf("failed to remove persisted invalidation markers: %v", err)
 	}

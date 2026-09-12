@@ -86,11 +86,16 @@ type Handler struct {
 	flightsMu   sync.Mutex
 	flights     map[string]*missFlight
 
-	// localStaleMu guards localStale.
+	// localStaleMu guards localStale and localFresh.
 	localStaleMu sync.Mutex
 	// localStale records invalidation times for a Cache that cannot report
 	// them itself. Unused when the cache implements staleAtChecker.
 	localStale map[string]time.Time
+	// localFresh records full-precision fetch/validation generations for a
+	// third-party Cache. Such a cache may return Resources without SetStoredAt,
+	// leaving only second-granular HTTP dates; a validation in the same second
+	// as a mutation would otherwise remain stale for the marker's lifetime.
+	localFresh map[string]time.Time
 	// localStaleTTL is how long those markers are kept; see
 	// HandlerOptions.StaleMarkerTTL.
 	localStaleTTL time.Duration
@@ -255,7 +260,16 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			if cReq.servedKey != "" && cReq.servedKey != keys[0] {
 				keys = append(keys, cReq.servedKey)
 			}
-			_ = h.cache.Freshen(res, keys...)
+			if err := h.cache.Freshen(res, keys...); err != nil {
+				// The validation may have raced a newer invalidation, or the
+				// cache may have failed to persist it. Serving the old body as a
+				// HIT would be unsafe; fetch the current representation in full.
+				h.debugf("freshening cached response failed: %v", err)
+				_ = res.Close()
+				h.passUpstream(rw, cReq, nil)
+				return
+			}
+			h.recordFresh(cReq.Time, keys...)
 		} else {
 			h.debugf("response is changed")
 			_ = res.Close()
@@ -423,6 +437,10 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete 
 
 	// just the headers! Use a clone so storeResource can mutate (e.g. RemovePrivateHeaders) without racing with the client reading rw.Header().
 	res := NewResourceBytes(rw.StatusCode, nil, rw.Header().Clone())
+	// Store the precise local start of this upstream fetch. The cache uses it
+	// to order an in-flight response against a concurrent invalidation without
+	// relying on second-granular HTTP dates.
+	res.RequestTime = t
 	if !h.isCacheable(res, r) {
 		h.debugf("resource is uncacheable")
 		rw.Header().Set(CacheHeader, "SKIP")
@@ -715,9 +733,57 @@ func (h *Handler) recordStale(keys ...string) {
 			delete(h.localStale, key)
 		}
 	}
+	for key, at := range h.localFresh {
+		if at.Before(cutoff) {
+			delete(h.localFresh, key)
+		}
+	}
 	for _, key := range keys {
 		h.localStale[key] = now
 	}
+}
+
+// recordFresh notes the precise generation represented by keys when the
+// Cache cannot expose one itself. at is the start of the upstream fetch or
+// validation, rather than its completion, so an operation already in flight
+// when a mutation occurs cannot make older content appear newer.
+func (h *Handler) recordFresh(at time.Time, keys ...string) {
+	if _, ok := h.cache.(staleAtChecker); ok {
+		return
+	}
+	if at.IsZero() {
+		at = Clock()
+	}
+
+	cutoff := Clock().Add(-h.staleMarkerTTL())
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	if h.localFresh == nil {
+		h.localFresh = make(map[string]time.Time)
+	}
+	for key, recordedAt := range h.localFresh {
+		if recordedAt.Before(cutoff) {
+			delete(h.localFresh, key)
+		}
+	}
+	for _, key := range keys {
+		if previous, ok := h.localFresh[key]; !ok || at.After(previous) {
+			h.localFresh[key] = at
+		}
+	}
+}
+
+// locallyFreshAfter reports whether the handler observed key being fetched or
+// validated after an invalidation. It supplies the precision that the Cache
+// interface cannot require from existing third-party implementations.
+func (h *Handler) locallyFreshAfter(key string, staleAt time.Time) bool {
+	if _, ok := h.cache.(staleAtChecker); ok {
+		return false
+	}
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	at, ok := h.localFresh[key]
+	return ok && at.After(staleAt)
 }
 
 // staleAt reports when key was invalidated, from whichever record exists.
@@ -789,6 +855,7 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 				h.metrics.RecordStoreOperation(false)
 			}
 		} else {
+			h.recordFresh(r.Time, keys...)
 			if h.metrics != nil {
 				h.metrics.RecordStoreOperation(true)
 			}
@@ -894,7 +961,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 				// second-granular and the marker is not, so a variant
 				// revalidated in the same second as the mutation could never
 				// clear it and was revalidated upstream on every request.
-				if !varied.StoredAfter(staleAt) {
+				if !h.locallyFreshAfter(variantKey, staleAt) && !varied.StoredAfter(staleAt) {
 					varied.MarkStale()
 				}
 			} else if baseStale {
