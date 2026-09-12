@@ -320,6 +320,42 @@ func TestUnsafeStatusWaitsForInvalidation(t *testing.T) {
 	}
 }
 
+// TestUnsafeResponseForwardsTrailersAfterInvalidation covers keeping the
+// private initial-header map after it has been committed. net/http handlers
+// set declared trailer values through Header after their body writes, so the
+// streamer must expose the wrapped writer's map again at that point.
+func TestUnsafeResponseForwardsTrailersAfterInvalidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "after body", body: "body"},
+		{name: "empty body"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+			defer func() { _ = cache.Close() }()
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Trailer", "Digest")
+				w.WriteHeader(http.StatusOK)
+				if tc.body != "" {
+					_, _ = w.Write([]byte(tc.body))
+				}
+				w.Header().Set("Digest", "sha-256=finished")
+			})
+			h := NewHandler(cache, upstream)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "http://example.org/thing", nil))
+
+			res := rec.Result()
+			defer func() { _ = res.Body.Close() }()
+			if got := res.Trailer.Get("Digest"); got != "sha-256=finished" {
+				t.Fatalf("response trailer = %q, want sha-256=finished", got)
+			}
+		})
+	}
+}
+
 // --- Codex review follow-ups (PR #5) ---
 
 // TestInvalidationCoversVaryVariants is the regression test for invalidation

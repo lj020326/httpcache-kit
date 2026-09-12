@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	logger "github.com/soulteary/logger-kit/v2"
@@ -1319,6 +1320,7 @@ func newResponseStreamer(w http.ResponseWriter) (*responseStreamer, error) {
 		pipeReader:     pr,
 		pipeWriter:     pw,
 		C:              make(chan struct{}),
+		commitC:        make(chan struct{}),
 	}, nil
 }
 
@@ -1338,15 +1340,17 @@ type responseStreamer struct {
 	responseHeader http.Header
 	// C is closed by WriteHeader to signal the headers' writing. headerOnce ensures it is closed at most once.
 	C          chan struct{}
+	commitC    chan struct{}
 	headerOnce sync.Once
 	commitOnce sync.Once
+	committed  atomic.Bool
 }
 
 // Header implements http.ResponseWriter. Ordinary responses retain the
 // wrapped writer's behavior. State-changing responses use a private copy so
 // neither their status nor headers become observable before invalidation.
 func (rw *responseStreamer) Header() http.Header {
-	if !rw.deferHeaders {
+	if !rw.deferHeaders || rw.committed.Load() {
 		return rw.ResponseWriter.Header()
 	}
 	if rw.bufferedHeader == nil {
@@ -1364,14 +1368,23 @@ func (rw *responseStreamer) WaitHeaders() {
 // WriteHeader implements http.ResponseWriter. Safe if called more than once;
 // only the first call publishes the status and immutable header snapshot.
 func (rw *responseStreamer) WriteHeader(status int) {
+	waitForCommit := false
 	rw.headerOnce.Do(func() {
 		rw.StatusCode = status
 		rw.responseHeader = rw.Header().Clone()
-		if !rw.deferHeaders {
+		if rw.deferHeaders {
+			waitForCommit = true
+		} else {
 			rw.CommitHeaders()
 		}
 		close(rw.C)
 	})
+	if waitForCommit {
+		// Prevent the upstream handler from changing deferred headers or
+		// publishing trailer values while CommitHeaders snapshots the former.
+		// It resumes as soon as invalidation and the client commit complete.
+		<-rw.commitC
+	}
 }
 
 // CommitHeaders makes the first status and its header snapshot observable to
@@ -1389,6 +1402,13 @@ func (rw *responseStreamer) CommitHeaders() {
 			}
 		}
 		rw.ResponseWriter.WriteHeader(rw.StatusCode)
+		// Once the initial headers are committed, Header must expose the
+		// wrapped map again. net/http handlers publish declared trailer values
+		// there after their body writes complete.
+		rw.committed.Store(true)
+		if rw.commitC != nil {
+			close(rw.commitC)
+		}
 	})
 }
 
