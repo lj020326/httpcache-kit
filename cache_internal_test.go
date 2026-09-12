@@ -632,15 +632,38 @@ func TestAtomicWriteFilePreservesPreviousSnapshot(t *testing.T) {
 // that name; overwriting it on disk and deleting it on read made HIT responses
 // differ from the original MISS.
 func TestStoredAtMetadataPreservesOriginHeader(t *testing.T) {
-	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
 	defer func() { _ = c.Close() }()
 
 	const key = "GET:http://example.org/origin-header"
-	const value = "origin-owned-value"
+	const headerName = "X-Httpcache-Internal-Stored-At"
+	// Deliberately parseable as the interim metadata format. A non-time value
+	// would miss the ambiguous upgrade case that caused the field to be lost.
+	const value = "2026-09-12T00:00:00.123456789Z"
 	res := NewResourceBytes(http.StatusOK, []byte("body"), http.Header{
-		legacyStoredAtHeader: {value},
+		headerName: {value},
 	})
 	if err := c.Store(res, key); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite just the header record without the new preamble, simulating an
+	// entry created before cache metadata had an unambiguous framing line.
+	hb := &bytes.Buffer{}
+	fmt.Fprintf(hb, "HTTP/1.1 %d %s\r\n", http.StatusOK, http.StatusText(http.StatusOK))
+	if err := headersToWriter(res.Header(), hb); err != nil {
+		t.Fatal(err)
+	}
+	path := headerPrefix + formatPrefix + hashKey(key)
+	f, err := c.fs.OpenFile(path, os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(hb.Bytes()); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -648,7 +671,7 @@ func TestStoredAtMetadataPreservesOriginHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := h.Get(legacyStoredAtHeader); got != value {
+	if got := h.Get(headerName); got != value {
 		t.Errorf("cached origin header = %q, want %q", got, value)
 	}
 	got, err := c.Retrieve(key)
@@ -656,7 +679,7 @@ func TestStoredAtMetadataPreservesOriginHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = got.Close() }()
-	if valueAfterHit := got.Header().Get(legacyStoredAtHeader); valueAfterHit != value {
+	if valueAfterHit := got.Header().Get(headerName); valueAfterHit != value {
 		t.Errorf("origin header after cache HIT = %q, want %q", valueAfterHit, value)
 	}
 }

@@ -38,9 +38,6 @@ const (
 	// outside the response header namespace means no origin field can collide
 	// with it.
 	storedAtPreamble = "HTTPCACHE/1 "
-	// legacyStoredAtHeader is read only for disk entries written by an earlier
-	// PR revision. New entries preserve an origin's field with this name.
-	legacyStoredAtHeader = "X-Httpcache-Internal-Stored-At"
 )
 
 // Returned when a resource doesn't exist
@@ -156,6 +153,10 @@ func NewVFSCache(fs vfs.VFS) Cache {
 
 // NewVFSCacheWithConfig returns a cache backend with custom configuration
 func NewVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig) ExtendedCache {
+	return newVFSCacheWithConfig(fs, config, "")
+}
+
+func newVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig, diskRoot string) ExtendedCache {
 	if config == nil {
 		config = DefaultCacheConfig()
 	}
@@ -164,11 +165,21 @@ func NewVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig) ExtendedCache {
 	c := &cache{
 		fs:       fs,
 		config:   config,
+		diskRoot: diskRoot,
 		stale:    make(map[string]time.Time),
 		lruList:  list.New(),
 		lruIndex: make(map[string]*cacheEntry),
 		stopChan: make(chan struct{}),
 	}
+
+	// A caller may supply a persistent or deliberately reused VFS. Restore it
+	// here rather than only in NewDiskCacheWithConfig; otherwise its body and
+	// header files survive reconstruction while the invalidation markers do
+	// not, republishing pre-mutation entries as fresh.
+	if err := c.scanExistingCache(); err != nil {
+		debugf("warning: failed to scan existing cache: %v", err)
+	}
+	c.loadStale()
 
 	// Start cleanup goroutine if interval is configured
 	if config.CleanupInterval > 0 {
@@ -210,25 +221,14 @@ func NewDiskCacheWithConfig(dir string, config *CacheConfig) (ExtendedCache, err
 	if err != nil {
 		return nil, err
 	}
-	extCache := NewVFSCacheWithConfig(chfs, config)
-
-	// Scan existing cache files to rebuild LRU index
-	if c, ok := extCache.(*cache); ok {
-		c.diskRoot = root
-		if err := c.scanExistingCache(); err != nil {
-			debugf("warning: failed to scan existing cache: %v", err)
-		}
-		// After the scan: those entries are exactly the ones the markers
-		// judge, so restoring the markers without them would be pointless and
-		// restoring them after is what makes the pair consistent.
-		c.loadStale()
-	}
-
-	return extCache, nil
+	// Supply the OS root before restoration and the cleanup goroutine start,
+	// so every disk marker write can use atomic replacement without a race.
+	return newVFSCacheWithConfig(chfs, config, root), nil
 }
 
 // scanExistingCache scans the cache directory for existing cached files
-// and rebuilds the LRU index. This is called on startup for disk-backed caches.
+// and rebuilds the LRU index. Constructors call it for any potentially
+// persistent VFS.
 func (c *cache) scanExistingCache() error {
 	start := Clock()
 	scannedFiles := 0
@@ -252,9 +252,11 @@ func (c *cache) scanExistingCache() error {
 		if headerInfo, err := c.fs.Stat(headerPath); err == nil {
 			entry.size += headerInfo.Size()
 			// Freshen does not rewrite the body, so its mtime cannot carry the
-			// new validation generation across a restart. Prefer the timestamp
-			// persisted in the header and retain the body mtime only for cache
-			// records written by older versions.
+			// new validation generation across a restart. The header is written
+			// on both Store and Freshen, making its mtime the safe old-format
+			// fallback; a new-format preamble supplies the exact timestamp.
+			entry.storedAt = headerInfo.ModTime()
+			entry.accessedAt = headerInfo.ModTime()
 			if _, persistedAt, readErr := c.readHeaderFile(headerPath, hashedKey); readErr == nil && !persistedAt.IsZero() {
 				entry.storedAt = persistedAt
 				entry.accessedAt = persistedAt
@@ -381,15 +383,6 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 		return Header{}, time.Time{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
 
-	// Backward compatibility for entries written while the timestamp lived in
-	// a private-looking HTTP field. A new-format preamble is authoritative and
-	// leaves a legitimate origin field of the same name untouched.
-	if raw := h.Get(legacyStoredAtHeader); storedAt.IsZero() && raw != "" {
-		if parsed, parseErr := time.Parse(time.RFC3339Nano, raw); parseErr == nil {
-			storedAt = parsed
-			h.Del(legacyStoredAtHeader)
-		}
-	}
 	return h, storedAt, nil
 }
 

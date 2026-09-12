@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/soulteary/vfs-kit"
 )
 
 // TestInvalidationKeys covers the key set RFC 7234 section 4.4 requires a
@@ -839,6 +841,39 @@ func TestInvalidationSurvivesARestart(t *testing.T) {
 	defer func() { _ = got.Close() }()
 	if !got.IsStale() {
 		t.Error("the pre-mutation entry came back fresh after a restart")
+	}
+}
+
+// TestInvalidationSurvivesPersistentVFSReopen covers callers that reuse a VFS
+// directly rather than constructing the built-in disk cache. The files and
+// marker snapshot both persist in that VFS, so reconstruction must restore
+// both halves before serving an entry.
+func TestInvalidationSurvivesPersistentVFSReopen(t *testing.T) {
+	fs := vfs.Memory()
+	config := DefaultCacheConfig().WithCleanupInterval(0)
+	const key = "GET:http://example.org/persistent-vfs"
+
+	first := NewVFSCacheWithConfig(fs, config)
+	if err := first.Store(NewResourceBytes(http.StatusOK, []byte("before"), http.Header{}), key); err != nil {
+		t.Fatal(err)
+	}
+	first.Invalidate(key)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := NewVFSCacheWithConfig(fs, config)
+	defer func() { _ = second.Close() }()
+	if _, marked := second.(*cache).StaleAt(key); !marked {
+		t.Fatal("persistent VFS invalidation marker was not restored")
+	}
+	got, err := second.Retrieve(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = got.Close() }()
+	if !got.IsStale() {
+		t.Error("pre-mutation entry from a persistent VFS was served fresh after reconstruction")
 	}
 }
 
