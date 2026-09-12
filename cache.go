@@ -333,11 +333,11 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	}
 
 	var storedAt time.Time
-	if raw := h.Header.Get(storedAtHeader); raw != "" {
+	if raw := h.Get(storedAtHeader); raw != "" {
 		if parsed, parseErr := time.Parse(time.RFC3339Nano, raw); parseErr == nil {
 			storedAt = parsed
 		}
-		h.Header.Del(storedAtHeader)
+		h.Del(storedAtHeader)
 	}
 	return h, storedAt, nil
 }
