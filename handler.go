@@ -269,7 +269,11 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 				h.passUpstream(rw, cReq, nil)
 				return
 			}
-			h.recordFresh(cReq.Time, keys...)
+			// Validator records the precise instant at which the conditional
+			// request began. cReq.Time predates cache lookup and can therefore
+			// precede a concurrent mutation even though validation itself began
+			// after it.
+			h.recordFresh(res.RequestTime, keys...)
 		} else {
 			h.debugf("response is changed")
 			_ = res.Close()
@@ -791,6 +795,18 @@ func (h *Handler) locallyFreshAfter(key string, staleAt time.Time) bool {
 	return ok && at.After(staleAt)
 }
 
+// resourceFreshAfter uses the generation evidence owned by the component that
+// also owns invalidation ordering. A cache exposing StaleAt can compare its
+// full-precision stored generation. For an opaque third-party cache, only the
+// handler's request/validation start record proves that work did not begin
+// before the mutation; a later file-write timestamp does not.
+func (h *Handler) resourceFreshAfter(res *Resource, key string, staleAt time.Time) bool {
+	if _, ok := h.cache.(staleAtChecker); ok {
+		return res.StoredAfter(staleAt)
+	}
+	return h.locallyFreshAfter(key, staleAt)
+}
+
 // staleAt reports when key was invalidated, from whichever record exists.
 func (h *Handler) staleAt(key string) (time.Time, bool) {
 	if checker, ok := h.cache.(staleAtChecker); ok {
@@ -898,23 +914,39 @@ type staleAtChecker interface {
 // lookupResource finds the best matching Resource for the
 // request, or nil and ErrNotFoundInCache if none is found
 func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
-	res, err := h.cache.Retrieve(req.Key.String())
+	lookupKey := req.Key
+	baseKey := lookupKey.String()
+	res, err := h.cache.Retrieve(baseKey)
 
 	// HEAD requests can possibly be served from GET
 	if err == ErrNotFoundInCache && req.Method == "HEAD" {
-		res, err = h.cache.Retrieve(req.Key.ForMethod("GET").String())
+		lookupKey = req.Key.ForMethod("GET")
+		baseKey = lookupKey.String()
+		res, err = h.cache.Retrieve(baseKey)
 		if err != nil {
 			return nil, err
 		}
 
 		if res.HasExplicitExpiration() && req.isCacheable() {
 			h.debugf("using cached GET request for serving HEAD")
-			return res, nil
+			req.servedKey = baseKey
 		} else {
+			_ = res.Close()
 			return nil, ErrNotFoundInCache
 		}
 	} else if err != nil {
 		return res, err
+	}
+
+	// A third-party Cache can complete a pre-mutation background Store after
+	// its own Invalidate call. The handler's generation record is what prevents
+	// that ordinary (non-Vary) base entry from being republished as a fresh HIT.
+	// Built-in caches reach the same conclusion through StoredAt/StaleAt, so the
+	// check is harmless for them as well.
+	if staleAt, marked := h.staleAt(baseKey); marked {
+		if !h.resourceFreshAfter(res, baseKey, staleAt) {
+			res.MarkStale()
+		}
 	}
 
 	// Secondary lookup for Vary
@@ -925,9 +957,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 		}
 		// Whether the BASE entry was invalidated, read before it is closed.
 		baseStale := res.IsStale()
-		baseKey := req.Key.String()
-
-		variantKey := req.Key.Vary(vary, req.Request).String()
+		variantKey := lookupKey.Vary(vary, req.Request).String()
 		varied, varyErr := h.cache.Retrieve(variantKey)
 		// The primary entry is not the one we serve, and nothing else will
 		// close it. Releasing it here is what keeps the disk backend from
@@ -966,7 +996,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 				// second-granular and the marker is not, so a variant
 				// revalidated in the same second as the mutation could never
 				// clear it and was revalidated upstream on every request.
-				if !h.locallyFreshAfter(variantKey, staleAt) && !varied.StoredAfter(staleAt) {
+				if !h.resourceFreshAfter(varied, variantKey, staleAt) {
 					varied.MarkStale()
 				}
 			} else if baseStale {
@@ -1018,8 +1048,29 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	if err != nil {
 		return nil
 	}
-	if u.Host != "" && !strings.EqualFold(u.Host, r.Host) {
-		return nil
+	if u.Host != "" {
+		requestScheme := strings.ToLower(r.URL.Scheme)
+		if requestScheme == "" {
+			requestScheme = "http"
+			if r.TLS != nil {
+				requestScheme = "https"
+			}
+		}
+		targetScheme := strings.ToLower(u.Scheme)
+		if targetScheme == "" {
+			targetScheme = requestScheme
+		}
+
+		requestAuthority := r.Host
+		if requestAuthority == "" {
+			requestAuthority = r.URL.Host
+		}
+		requestHost, requestPort, requestOK := normalizedOriginAuthority(requestScheme, requestAuthority)
+		targetHost, targetPort, targetOK := normalizedOriginAuthority(targetScheme, u.Host)
+		if !requestOK || !targetOK || requestScheme != targetScheme ||
+			!strings.EqualFold(requestHost, targetHost) || requestPort != targetPort {
+			return nil
+		}
 	}
 	// RawPath is carried through: url.Parse records "/objects/a%2Fb" in
 	// RawPath and the decoded "/objects/a/b" in Path, so dropping it produced
@@ -1037,11 +1088,8 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	}
 	target := *r.URL
 	originForm := r.URL.Scheme == "" && r.URL.Host == ""
-	// The scheme is part of the cache key, so an absolute target naming one
-	// must keep it. Cloning r.URL wholesale turned "Location:
-	// https://example.org/item" into a key for http://example.org/item --
-	// invalidating an unrelated entry while the representation the origin
-	// actually named stayed fresh.
+	// The scheme is part of an absolute-form cache key, so an absolute target
+	// keeps the scheme it explicitly named after the same-origin check above.
 	// A server normally receives origin-form request targets, where URL has
 	// neither Scheme nor Host and Host lives on the Request itself. Keep that
 	// shape even when Location is absolute: otherwise setting only Scheme
@@ -1067,6 +1115,36 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	target.ForceQuery = ref.ForceQuery
 	target.Fragment = ""
 	return &target
+}
+
+// normalizedOriginAuthority separates a URL authority into its case-insensitive
+// host and effective port. An omitted HTTP(S) default port is equivalent to an
+// explicitly written one, which a raw comparison of url.URL.Host cannot see.
+func normalizedOriginAuthority(scheme, authority string) (host, port string, ok bool) {
+	u, err := url.Parse("//" + authority)
+	if err != nil || u.Host == "" {
+		return "", "", false
+	}
+	host = u.Hostname()
+	if host == "" {
+		return "", "", false
+	}
+	port = u.Port()
+	if port == "" {
+		switch strings.ToLower(scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	} else {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return "", "", false
+		}
+		port = strconv.FormatUint(n, 10)
+	}
+	return host, port, true
 }
 
 func (r *cacheRequest) isStateChanging() bool {

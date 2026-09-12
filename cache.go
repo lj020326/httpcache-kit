@@ -106,8 +106,7 @@ type cache struct {
 	config *CacheConfig
 	// diskRoot is set only by NewDiskCacheWithConfig. It lets the marker
 	// snapshot use os.Rename, which the deliberately small vfs.VFS interface
-	// does not expose, while custom and in-memory VFS backends keep using the
-	// ordinary writer.
+	// does not expose; custom VFS backends use the two-slot journal instead.
 	diskRoot string
 
 	// generationMu orders complete stores/freshens against invalidations.
@@ -118,8 +117,9 @@ type cache struct {
 	generationMu sync.RWMutex
 
 	// stale map with mutex protection
-	stale      map[string]time.Time
-	staleMutex sync.RWMutex
+	stale           map[string]time.Time
+	staleGeneration uint64
+	staleMutex      sync.RWMutex
 
 	// LRU tracking
 	lruList   *list.List             // front = most recently used
@@ -315,10 +315,13 @@ func (c *cache) vfsWrite(path string, r io.Reader) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to open cache file %q: %w", path, err)
 	}
-	defer func() { _ = f.Close() }()
 	n, err := io.Copy(f, r)
 	if err != nil {
+		_ = f.Close()
 		return 0, fmt.Errorf("failed to write cache file %q: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return 0, fmt.Errorf("failed to close cache file %q: %w", path, err)
 	}
 	return n, nil
 }
@@ -568,10 +571,24 @@ func (c *cache) Invalidate(keys ...string) {
 	c.persistStale(snapshot)
 }
 
-// staleMapPath is where the invalidation markers are kept in the backing
-// store. The other entries live under hashed-key prefixes, so this cannot
-// collide with one.
+// staleMapPath is the atomic OS-backed snapshot and the legacy generic-VFS
+// snapshot path. The other entries live under hashed-key prefixes, so it
+// cannot collide with one.
 const staleMapPath = "stale-markers.json"
+
+// staleSnapshot is the bounded two-slot journal used when all that is known
+// about a caller-provided VFS is the small vfs.VFS interface. That interface
+// has no Rename or Sync operation, so rewriting one snapshot in place cannot
+// be made failure-safe. Each generation overwrites the older slot while the
+// other slot remains intact; startup selects the highest complete generation.
+type staleSnapshot struct {
+	Generation uint64               `json:"generation"`
+	Markers    map[string]time.Time `json:"markers"`
+}
+
+func staleMapSlotPath(generation uint64) string {
+	return "stale-markers." + strconv.FormatUint(generation%2, 10) + ".json"
+}
 
 // snapshotStaleLocked copies the marker map. Callers hold staleMutex.
 func (c *cache) snapshotStaleLocked() map[string]time.Time {
@@ -590,7 +607,14 @@ func (c *cache) snapshotStaleLocked() map[string]time.Time {
 // correct, so the mutation this accompanies has still been honoured for the
 // life of the process. What is lost is only the restart guarantee.
 func (c *cache) persistStale(snapshot map[string]time.Time) {
-	encoded, err := json.Marshal(snapshot)
+	persisted := interface{}(snapshot)
+	nextGeneration := c.staleGeneration
+	if c.diskRoot == "" {
+		nextGeneration++
+		persisted = staleSnapshot{Generation: nextGeneration, Markers: snapshot}
+	}
+
+	encoded, err := json.Marshal(persisted)
 	if err != nil {
 		debugf("failed to encode invalidation markers: %v", err)
 		return
@@ -599,30 +623,72 @@ func (c *cache) persistStale(snapshot map[string]time.Time) {
 	if c.diskRoot != "" {
 		_, writeErr = atomicWriteFile(filepath.Join(c.diskRoot, filepath.FromSlash(staleMapPath)), bytes.NewReader(encoded))
 	} else {
-		_, writeErr = c.vfsWrite(staleMapPath, bytes.NewReader(encoded))
+		_, writeErr = c.vfsWrite(staleMapSlotPath(nextGeneration), bytes.NewReader(encoded))
 	}
 	if writeErr != nil {
 		debugf("failed to persist invalidation markers: %v", writeErr)
+		return
+	}
+	if c.diskRoot == "" {
+		c.staleGeneration = nextGeneration
 	}
 }
 
 // loadStale restores markers written by a previous process.
 func (c *cache) loadStale() {
-	f, err := c.fs.Open(staleMapPath)
-	if err != nil {
+	// Caller-provided persistent VFS backends use alternating snapshots. A
+	// malformed newest slot (for example after a short write) is ignored and
+	// the other complete generation remains authoritative.
+	if c.diskRoot == "" {
+		var best staleSnapshot
+		found := false
+		for slot := uint64(0); slot < 2; slot++ {
+			var candidate staleSnapshot
+			if err := c.readStaleJSON(staleMapSlotPath(slot), &candidate); err != nil {
+				if !vfs.IsNotExist(err) {
+					debugf("failed to read invalidation marker slot %d: %v", slot, err)
+				}
+				continue
+			}
+			if candidate.Generation == 0 || candidate.Markers == nil {
+				debugf("ignoring invalid invalidation marker slot %d", slot)
+				continue
+			}
+			if !found || candidate.Generation > best.Generation {
+				best = candidate
+				found = true
+			}
+		}
+		if found {
+			c.restoreStale(best.Markers)
+			c.staleGeneration = best.Generation
+			return
+		}
+	}
+
+	// Legacy generic-VFS snapshots and current OS-backed snapshots use the raw
+	// marker map. Once a generic VFS writes a journal slot, the legacy file is
+	// deliberately ignored so an older snapshot cannot resurrect swept keys.
+	var restored map[string]time.Time
+	if err := c.readStaleJSON(staleMapPath, &restored); err != nil {
 		if !vfs.IsNotExist(err) {
-			debugf("failed to open invalidation markers: %v", err)
+			debugf("failed to read invalidation markers: %v", err)
 		}
 		return
 	}
-	defer func() { _ = f.Close() }()
+	c.restoreStale(restored)
+}
 
-	var restored map[string]time.Time
-	if err := json.NewDecoder(f).Decode(&restored); err != nil {
-		debugf("failed to decode invalidation markers: %v", err)
-		return
+func (c *cache) readStaleJSON(path string, dst interface{}) error {
+	f, err := c.fs.Open(path)
+	if err != nil {
+		return err
 	}
+	defer func() { _ = f.Close() }()
+	return json.NewDecoder(f).Decode(dst)
+}
 
+func (c *cache) restoreStale(restored map[string]time.Time) {
 	c.staleMutex.Lock()
 	defer c.staleMutex.Unlock()
 	for key, at := range restored {
@@ -1127,14 +1193,13 @@ func (c *cache) Purge() error {
 		elem = next
 	}
 
-	// Clear stale map, in the backing store too: leaving the file behind
-	// would restore markers for entries this call just removed.
+	// Clear the stale map in the backing store too. Persisting an empty newest
+	// generation is safer than deleting journal slots one by one: a restart can
+	// never select an older non-empty generation between those removals.
 	c.staleMutex.Lock()
 	defer c.staleMutex.Unlock()
 	c.stale = make(map[string]time.Time)
-	if err := c.fs.Remove(staleMapPath); err != nil && !vfs.IsNotExist(err) {
-		debugf("failed to remove persisted invalidation markers: %v", err)
-	}
+	c.persistStale(c.snapshotStaleLocked())
 
 	return nil
 }

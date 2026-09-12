@@ -338,30 +338,46 @@ func TestInvalidationKeysPreserveEscapedPaths(t *testing.T) {
 	}
 }
 
-// TestInvalidationKeysPreserveTargetScheme is the regression test for cloning
-// r.URL wholesale. The scheme is part of the cache key, so an absolute
-// same-host target naming another scheme produced a key for the REQUEST's
-// scheme: "Location: https://example.org/item" invalidated
-// http://example.org/item and left the representation the origin actually
-// named fresh.
-func TestInvalidationKeysPreserveTargetScheme(t *testing.T) {
+// TestInvalidationTargetsRequireTheSameScheme keeps URI invalidation within
+// the effective request origin. Matching host names are insufficient when the
+// schemes (and therefore their default ports) differ.
+func TestInvalidationTargetsRequireTheSameScheme(t *testing.T) {
 	r := httptest.NewRequest("POST", "http://example.org/objects", nil)
 	cr, err := newCacheRequest(r)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	u := cr.sameOriginURL("https://example.org/item")
-	if u == nil {
-		t.Fatal("sameOriginURL returned nil for a same-host Location")
+	if u := cr.sameOriginURL("https://example.org/item"); u != nil {
+		t.Fatalf("cross-scheme target = %#v, want nil", u)
 	}
-	if u.Scheme != "https" {
-		t.Errorf("scheme = %q, want https -- the target named it explicitly", u.Scheme)
+	u := cr.sameOriginURL("http://example.org/item")
+	if u == nil || u.Scheme != "http" {
+		t.Fatalf("same-origin target = %#v, want an HTTP URL", u)
 	}
 
 	// A relative target still inherits the request's scheme.
 	if rel := cr.sameOriginURL("/item"); rel == nil || rel.Scheme != "http" {
 		t.Errorf("relative target scheme = %v, want http", rel)
+	}
+}
+
+// TestInvalidationOriginNormalizesDefaultPorts is the regression test for
+// comparing raw authorities. example.org and example.org:80 identify the same
+// HTTP origin, while an explicitly different effective port does not.
+func TestInvalidationOriginNormalizesDefaultPorts(t *testing.T) {
+	r := httptest.NewRequest("POST", "/objects", nil)
+	r.Host = "example.org"
+	cr, err := newCacheRequest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if u := cr.sameOriginURL("http://example.org:80/item"); u == nil {
+		t.Fatal("explicit HTTP default port was treated as cross-origin")
+	}
+	if u := cr.sameOriginURL("http://example.org:8080/item"); u != nil {
+		t.Fatalf("different effective port target = %#v, want nil", u)
 	}
 }
 
@@ -523,6 +539,93 @@ func (c plainCache) Freshen(res *Resource, keys ...string) error {
 	return c.inner.Freshen(res, keys...)
 }
 
+// delayedStoreCache models an opaque third-party backend whose invalidation
+// cannot order itself against a Store already in flight. The first Store is
+// released only after the mutation has returned, so it overwrites the cache
+// with pre-mutation content at a later file-write time.
+type delayedStoreCache struct {
+	inner   Cache
+	delay   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *delayedStoreCache) Header(key string) (Header, error) {
+	return c.inner.Header(key)
+}
+
+func (c *delayedStoreCache) Store(res *Resource, keys ...string) error {
+	if c.delay.CompareAndSwap(true, false) {
+		close(c.started)
+		<-c.release
+	}
+	return c.inner.Store(res, keys...)
+}
+
+func (c *delayedStoreCache) Retrieve(key string) (*Resource, error) {
+	return c.inner.Retrieve(key)
+}
+
+func (c *delayedStoreCache) Invalidate(_ ...string) {}
+
+func (c *delayedStoreCache) Freshen(res *Resource, keys ...string) error {
+	return c.inner.Freshen(res, keys...)
+}
+
+// TestFallbackInvalidatesLateNonVaryStore covers the handler-side generation
+// check being applied only after entering the Vary branch. An old ordinary
+// response could otherwise finish storing after a mutation and be served as a
+// fresh HIT by a third-party Cache that cannot expose invalidation timestamps.
+func TestFallbackInvalidatesLateNonVaryStore(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	cache := &delayedStoreCache{
+		inner:   NewMemoryCache(),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	cache.delay.Store(true)
+	current := "before"
+	var getCalls int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			current = "after"
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		atomic.AddInt32(&getCalls, 1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		_, _ = w.Write([]byte(current))
+	})
+	h := NewHandler(cache, upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest("GET", "http://example.org/thing", nil))
+	<-cache.started
+
+	now = now.Add(100 * time.Millisecond)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "http://example.org/thing", nil))
+	// Let the old Store acquire a completion timestamp newer than the marker.
+	// For an opaque cache that does not prove its ordering, this is not evidence
+	// that the response fetch itself began after the mutation.
+	now = now.Add(100 * time.Millisecond)
+	close(cache.release)
+	h.writes.Wait()
+
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, httptest.NewRequest("GET", "http://example.org/thing", nil))
+	if got := atomic.LoadInt32(&getCalls); got != 2 {
+		t.Fatalf("upstream GET calls = %d, want 2; late old Store was served as a HIT", got)
+	}
+	if got := second.Body.String(); got != "after" {
+		t.Errorf("response body = %q, want after", got)
+	}
+}
+
 // impreciseCache models an existing third-party Cache implementation. It does
 // not implement StaleAt and its Resources do not carry the optional
 // full-precision storedAt value introduced by the built-in cache.
@@ -532,6 +635,24 @@ func (c impreciseCache) Retrieve(key string) (*Resource, error) {
 	res, err := c.inner.Retrieve(key)
 	if res != nil {
 		res.SetStoredAt(time.Time{})
+	}
+	return res, err
+}
+
+// hookedImpreciseCache advances a controlled clock after lookup but before
+// conditional validation starts. It models time passing between those two
+// operations without implementing staleAtChecker.
+type hookedImpreciseCache struct {
+	impreciseCache
+	afterRetrieve func()
+}
+
+func (c *hookedImpreciseCache) Retrieve(key string) (*Resource, error) {
+	res, err := c.impreciseCache.Retrieve(key)
+	if c.afterRetrieve != nil {
+		after := c.afterRetrieve
+		c.afterRetrieve = nil
+		after()
 	}
 	return res, err
 }
@@ -631,7 +752,8 @@ func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
 		_, _ = w.Write([]byte("body"))
 	})
 
-	h := NewHandler(impreciseCache{plainCache{inner: NewMemoryCache()}}, upstream)
+	cache := &hookedImpreciseCache{impreciseCache: impreciseCache{plainCache{inner: NewMemoryCache()}}}
+	h := NewHandler(cache, upstream)
 	t.Cleanup(func() { h.writes.Wait() })
 	get := func() {
 		req := httptest.NewRequest("GET", "http://example.org/thing", nil)
@@ -643,7 +765,10 @@ func TestThirdPartyVariantValidationUsesPreciseHandlerTime(t *testing.T) {
 	h.writes.Wait()
 	now = now.Add(100 * time.Millisecond)
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "http://example.org/thing", nil))
-	now = now.Add(100 * time.Millisecond) // same HTTP-date second, but after the marker
+	// The next request itself is received at the marker time. Cache retrieval
+	// then takes 100ms, so validation starts later in the same HTTP-date second.
+	// Recording the request's earlier cReq.Time would fail to clear the marker.
+	cache.afterRetrieve = func() { now = now.Add(100 * time.Millisecond) }
 
 	before := atomic.LoadInt32(&upstreamHits)
 	get() // one conditional validation

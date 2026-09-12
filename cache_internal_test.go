@@ -562,6 +562,46 @@ func (w *writeFailWFile) Write(p []byte) (n int, err error) {
 	return 0, os.ErrPermission
 }
 
+type partialMarkerWFile struct {
+	vfs.WFile
+	wrote bool
+}
+
+func (w *partialMarkerWFile) Write(p []byte) (int, error) {
+	if w.wrote {
+		return 0, errors.New("injected marker snapshot failure")
+	}
+	w.wrote = true
+	n := len(p) / 2
+	if n == 0 {
+		n = 1
+	}
+	written, err := w.WFile.Write(p[:n])
+	if err != nil {
+		return written, err
+	}
+	return written, errors.New("injected marker snapshot failure")
+}
+
+type failSecondMarkerSnapshotVFS struct {
+	vfs.VFS
+	markerWrites int
+}
+
+func (v *failSecondMarkerSnapshotVFS) OpenFile(path string, flag int, perm os.FileMode) (vfs.WFile, error) {
+	f, err := v.VFS.OpenFile(path, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(path, "stale-markers.") {
+		v.markerWrites++
+		if v.markerWrites == 2 {
+			return &partialMarkerWFile{WFile: f}, nil
+		}
+	}
+	return f, nil
+}
+
 // writeFailVFS returns a WFile that fails Write so io.Copy in vfsWrite fails.
 type writeFailVFS struct {
 	vfs.VFS
@@ -625,6 +665,30 @@ func TestAtomicWriteFilePreservesPreviousSnapshot(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Errorf("temporary snapshot files were not cleaned up: %v", matches)
+	}
+}
+
+// TestVFSSnapshotPreservesPreviousGeneration covers persistent VFS backends
+// that do not expose an atomic Rename operation. A partial write of the next
+// slot must leave the other complete generation available after reconstruction.
+func TestVFSSnapshotPreservesPreviousGeneration(t *testing.T) {
+	fs := &failSecondMarkerSnapshotVFS{VFS: vfs.Memory()}
+	config := DefaultCacheConfig().WithCleanupInterval(0)
+	first := NewVFSCacheWithConfig(fs, config)
+	first.Invalidate("old-key")
+	first.Invalidate("new-key") // the second journal-slot write fails halfway
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := NewVFSCacheWithConfig(fs, config)
+	defer func() { _ = second.Close() }()
+	inner := second.(*cache)
+	if _, ok := inner.StaleAt("old-key"); !ok {
+		t.Fatal("partial VFS snapshot destroyed the previous invalidation generation")
+	}
+	if _, ok := inner.StaleAt("new-key"); ok {
+		t.Error("partially written invalidation generation was accepted as complete")
 	}
 }
 
