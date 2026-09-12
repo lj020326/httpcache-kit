@@ -1036,6 +1036,7 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 		ref = r.URL.ResolveReference(ref)
 	}
 	target := *r.URL
+	originForm := r.URL.Scheme == "" && r.URL.Host == ""
 	// The scheme is part of the cache key, so an absolute target naming one
 	// must keep it. Cloning r.URL wholesale turned "Location:
 	// https://example.org/item" into a key for http://example.org/item --
@@ -1047,11 +1048,17 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	// produces "http:/item", a different key from the direct request's
 	// "/item". For absolute-form requests, the target's explicit scheme still
 	// belongs in the key.
-	if u.Scheme != "" && (r.URL.Scheme != "" || r.URL.Host != "") {
+	if u.Scheme != "" && !originForm {
 		target.Scheme = u.Scheme
 	}
 	target.Path = ref.Path
 	target.RawPath = ref.RawPath
+	// RFC 3986 treats an authority with an empty path as "/" for HTTP. Once
+	// an absolute or network-path target is reshaped to origin-form, keeping
+	// the empty path would make "?q" instead of the direct request's "/?q".
+	if originForm && (u.Scheme != "" || u.Host != "") && target.Path == "" {
+		target.Path = "/"
+	}
 	target.RawQuery = ref.RawQuery
 	// ForceQuery too, or "/item?" and "/item" produce the same key while
 	// NewRequestKey keeps them apart -- and, because target starts as a clone

@@ -387,6 +387,19 @@ func TestAbsoluteInvalidationTargetMatchesOriginFormRequest(t *testing.T) {
 	if got, want := NewKey("GET", u, r.Header).String(), NewRequestKey(direct).String(); got != want {
 		t.Errorf("invalidation key = %q, direct request key = %q", got, want)
 	}
+
+	root := cr.sameOriginURL("http://example.org?q")
+	if root == nil {
+		t.Fatal("sameOriginURL returned nil for an absolute root target")
+	}
+	if root.Path != "/" || root.RawQuery != "q" {
+		t.Fatalf("empty-path absolute target = %#v, want origin-form /?q", root)
+	}
+	directRoot := httptest.NewRequest("GET", "/?q", nil)
+	directRoot.Host = r.Host
+	if got, want := NewKey("GET", root, r.Header).String(), NewRequestKey(directRoot).String(); got != want {
+		t.Errorf("root invalidation key = %q, direct request key = %q", got, want)
+	}
 }
 
 // TestStaleMarkerOutlivesTheEntriesItJudges is the regression test for sweeping

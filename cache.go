@@ -14,6 +14,7 @@ import (
 	"net/textproto"
 	"os"
 	pathutil "path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,6 +103,11 @@ type cacheEntry struct {
 type cache struct {
 	fs     vfs.VFS
 	config *CacheConfig
+	// diskRoot is set only by NewDiskCacheWithConfig. It lets the marker
+	// snapshot use os.Rename, which the deliberately small vfs.VFS interface
+	// does not expose, while custom and in-memory VFS backends keep using the
+	// ordinary writer.
+	diskRoot string
 
 	// generationMu orders complete stores/freshens against invalidations.
 	// A writer that started before a mutation must finish before the marker is
@@ -185,10 +191,14 @@ func NewDiskCache(dir string) (Cache, error) {
 
 // NewDiskCacheWithConfig returns a disk-backed cache with custom configuration
 func NewDiskCacheWithConfig(dir string, config *CacheConfig) (ExtendedCache, error) {
-	if err := os.MkdirAll(dir, 0750); err != nil {
+	root, err := filepath.Abs(dir)
+	if err != nil {
 		return nil, err
 	}
-	fs, err := vfs.FS(dir)
+	if err := os.MkdirAll(root, 0750); err != nil {
+		return nil, err
+	}
+	fs, err := vfs.FS(root)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +210,7 @@ func NewDiskCacheWithConfig(dir string, config *CacheConfig) (ExtendedCache, err
 
 	// Scan existing cache files to rebuild LRU index
 	if c, ok := extCache.(*cache); ok {
+		c.diskRoot = root
 		if err := c.scanExistingCache(); err != nil {
 			debugf("warning: failed to scan existing cache: %v", err)
 		}
@@ -302,6 +313,42 @@ func (c *cache) vfsWrite(path string, r io.Reader) (int64, error) {
 	n, err := io.Copy(f, r)
 	if err != nil {
 		return 0, fmt.Errorf("failed to write cache file %q: %w", path, err)
+	}
+	return n, nil
+}
+
+// atomicWriteFile writes a complete sibling temporary file before replacing
+// path. A failed copy, sync, or close therefore leaves the last valid target
+// untouched; os.Rename makes the final same-filesystem replacement atomic.
+func atomicWriteFile(path string, r io.Reader) (int64, error) {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return 0, fmt.Errorf("failed to create temporary cache file for %q: %w", path, err)
+	}
+	tmpPath := f.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
+		_ = os.Remove(tmpPath)
+	}()
+
+	n, err := io.Copy(f, r)
+	if err != nil {
+		return 0, fmt.Errorf("failed to write temporary cache file for %q: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		return 0, fmt.Errorf("failed to sync temporary cache file for %q: %w", path, err)
+	}
+	closeErr := f.Close()
+	closed = true
+	if closeErr != nil {
+		return 0, fmt.Errorf("failed to close temporary cache file for %q: %w", path, closeErr)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return 0, fmt.Errorf("failed to replace cache file %q: %w", path, err)
 	}
 	return n, nil
 }
@@ -555,8 +602,14 @@ func (c *cache) persistStale(snapshot map[string]time.Time) {
 		debugf("failed to encode invalidation markers: %v", err)
 		return
 	}
-	if _, err := c.vfsWrite(staleMapPath, bytes.NewReader(encoded)); err != nil {
-		debugf("failed to persist invalidation markers: %v", err)
+	var writeErr error
+	if c.diskRoot != "" {
+		_, writeErr = atomicWriteFile(filepath.Join(c.diskRoot, filepath.FromSlash(staleMapPath)), bytes.NewReader(encoded))
+	} else {
+		_, writeErr = c.vfsWrite(staleMapPath, bytes.NewReader(encoded))
+	}
+	if writeErr != nil {
+		debugf("failed to persist invalidation markers: %v", writeErr)
 	}
 }
 

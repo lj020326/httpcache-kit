@@ -584,6 +584,49 @@ func TestStore_VfsWriteCopyFails(t *testing.T) {
 	}
 }
 
+type failAfterDataReader struct {
+	delivered bool
+}
+
+func (r *failAfterDataReader) Read(p []byte) (int, error) {
+	if r.delivered {
+		return 0, errors.New("injected snapshot read failure")
+	}
+	r.delivered = true
+	return copy(p, "partial-new-snapshot"), nil
+}
+
+// TestAtomicWriteFilePreservesPreviousSnapshot is the regression test for
+// opening stale-markers.json with O_TRUNC. A crash, full disk, or copy error
+// during the next snapshot destroyed the previous valid markers and made
+// every older invalidation disappear after restart.
+func TestAtomicWriteFilePreservesPreviousSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, staleMapPath)
+	old := []byte(`{"old-key":"2026-09-12T00:00:00Z"}`)
+	if err := os.WriteFile(path, old, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := atomicWriteFile(path, &failAfterDataReader{}); err == nil {
+		t.Fatal("atomicWriteFile succeeded despite the injected copy failure")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, old) {
+		t.Errorf("snapshot after failed replacement = %q, want previous snapshot %q", got, old)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "."+filepath.Base(path)+".tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("temporary snapshot files were not cleaned up: %v", matches)
+	}
+}
+
 // headerFailAfterFirstVFS: OpenFile for header/ path succeeds first time, fails second (for Freshen storeHeader).
 type headerFailAfterFirstVFS struct {
 	vfs.VFS
