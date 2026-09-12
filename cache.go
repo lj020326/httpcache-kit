@@ -816,6 +816,23 @@ func (c *cache) StaleAt(key string) (time.Time, bool) {
 	return t, ok
 }
 
+// StaleSnapshot returns one atomic view of the requested invalidation
+// markers. Handler validation uses it for a base key and its Vary key so an
+// unsafe invalidation cannot be published between two independent StaleAt
+// calls and escape the post-Freshen supersession check.
+func (c *cache) StaleSnapshot(keys ...string) map[string]time.Time {
+	c.staleMutex.RLock()
+	defer c.staleMutex.RUnlock()
+
+	snapshot := make(map[string]time.Time, len(keys))
+	for _, key := range keys {
+		if at, ok := c.stale[key]; ok {
+			snapshot[key] = at
+		}
+	}
+	return snapshot
+}
+
 func (c *cache) Freshen(res *Resource, keys ...string) error {
 	var invalidate []string
 	err := func() error {

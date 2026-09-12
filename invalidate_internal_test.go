@@ -12,21 +12,22 @@ import (
 	"github.com/soulteary/vfs-kit"
 )
 
-type blockingSecondHeaderOpenVFS struct {
+type blockingHeaderOpenVFS struct {
 	vfs.VFS
 	headerOpens int
+	blockAt     int
 	entered     chan struct{}
 	release     chan struct{}
 }
 
-func (v *blockingSecondHeaderOpenVFS) OpenFile(path string, flag int, perm os.FileMode) (vfs.WFile, error) {
+func (v *blockingHeaderOpenVFS) OpenFile(path string, flag int, perm os.FileMode) (vfs.WFile, error) {
 	f, err := v.VFS.OpenFile(path, flag, perm)
 	if err != nil {
 		return nil, err
 	}
 	if strings.HasPrefix(path, "header/") {
 		v.headerOpens++
-		if v.headerOpens == 2 {
+		if v.headerOpens == v.blockAt {
 			close(v.entered)
 			<-v.release
 		}
@@ -1231,8 +1232,9 @@ func TestSuccessfulValidationClearsStaleWarning(t *testing.T) {
 }
 
 func TestValidationRefetchesWhenInvalidatedDuringFreshen(t *testing.T) {
-	fs := &blockingSecondHeaderOpenVFS{
+	fs := &blockingHeaderOpenVFS{
 		VFS:     vfs.Memory(),
+		blockAt: 3,
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
 	}
@@ -1245,6 +1247,7 @@ func TestValidationRefetchesWhenInvalidatedDuringFreshen(t *testing.T) {
 	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
 	defer func() { _ = c.Close() }()
 	req := httptest.NewRequest(http.MethodGet, "http://example.org/freshen-race", nil)
+	req.Header.Set("Accept-Language", "en")
 	cReq, err := newCacheRequest(req)
 	if err != nil {
 		t.Fatalf("newCacheRequest: %v", err)
@@ -1254,8 +1257,10 @@ func TestValidationRefetchesWhenInvalidatedDuringFreshen(t *testing.T) {
 		"Cache-Control": {"max-age=3600"},
 		"Date":          {time.Now().UTC().Format(http.TimeFormat)},
 		"ETag":          {`"v1"`},
+		"Vary":          {"Accept-Language"},
 	}
-	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("before"), headers.Clone()), key); err != nil {
+	variantKey := cReq.Key.Vary(headers.Get("Vary"), req).String()
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("before"), headers.Clone()), key, variantKey); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	c.Invalidate(key)

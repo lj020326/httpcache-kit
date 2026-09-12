@@ -271,8 +271,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			// after Freshen's initial check but before its header write returns.
 			// Recheck the validation START time now; the later header timestamp
 			// is not proof that a request begun before that mutation is current.
-			for _, key := range keys {
-				if staleAt, marked := h.staleAt(key); marked && !res.ReceivedAfter(staleAt) {
+			for key, staleAt := range h.staleSnapshot(keys) {
+				if !res.ReceivedAfter(staleAt) {
 					h.debugf("validation for %q was superseded after freshening by invalidation at %s", key, staleAt)
 					_ = res.Close()
 					h.passUpstream(rw, cReq, nil)
@@ -850,6 +850,36 @@ func (h *Handler) staleAt(key string) (time.Time, bool) {
 	return at, ok
 }
 
+// staleSnapshot reads the governed base/variant marker set at one
+// linearization point whenever the cache supports it. Handler-owned fallback
+// markers are copied under their single mutex. A legacy cache exposing only
+// StaleAt is queried in reverse order so the normally governing base key
+// (first in keys) is read last.
+func (h *Handler) staleSnapshot(keys []string) map[string]time.Time {
+	if checker, ok := h.cache.(staleSnapshotChecker); ok {
+		return checker.StaleSnapshot(keys...)
+	}
+	if checker, ok := h.cache.(staleAtChecker); ok {
+		snapshot := make(map[string]time.Time, len(keys))
+		for i := len(keys) - 1; i >= 0; i-- {
+			if at, marked := checker.StaleAt(keys[i]); marked {
+				snapshot[keys[i]] = at
+			}
+		}
+		return snapshot
+	}
+
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	snapshot := make(map[string]time.Time, len(keys))
+	for _, key := range keys {
+		if at, marked := h.localStale[key]; marked {
+			snapshot[key] = at
+		}
+	}
+	return snapshot
+}
+
 // invalidationKeys returns the cache keys made stale by a successful unsafe
 // request: the effective request URI, plus the URIs named by the response's
 // Location and Content-Location headers.
@@ -940,6 +970,12 @@ func (h *Handler) staleMarkerTTL() time.Duration {
 // gets the coarser base-entry fallback in lookup.
 type staleAtChecker interface {
 	StaleAt(key string) (time.Time, bool)
+}
+
+// staleSnapshotChecker is the multi-key form used after validating a Vary
+// response. Implementations return all requested markers from one generation.
+type staleSnapshotChecker interface {
+	StaleSnapshot(keys ...string) map[string]time.Time
 }
 
 // lookupResource finds the best matching Resource for the
