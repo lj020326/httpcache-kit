@@ -675,8 +675,15 @@ func TestVFSSnapshotPreservesPreviousGeneration(t *testing.T) {
 	fs := &failSecondMarkerSnapshotVFS{VFS: vfs.Memory()}
 	config := DefaultCacheConfig().WithCleanupInterval(0)
 	first := NewVFSCacheWithConfig(fs, config)
-	first.Invalidate("old-key")
-	first.Invalidate("new-key") // the second journal-slot write fails halfway
+	innerFirst := first.(*cache)
+	innerFirst.staleMutex.Lock()
+	innerFirst.stale["old-key"] = Clock()
+	innerFirst.persistStale(innerFirst.snapshotStaleLocked())
+	innerFirst.stale["new-key"] = Clock()
+	// The second journal-slot write fails halfway, as a crash during the next
+	// complete snapshot would. The first slot must remain authoritative.
+	innerFirst.persistStale(innerFirst.snapshotStaleLocked())
+	innerFirst.staleMutex.Unlock()
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -689,6 +696,108 @@ func TestVFSSnapshotPreservesPreviousGeneration(t *testing.T) {
 	}
 	if _, ok := inner.StaleAt("new-key"); ok {
 		t.Error("partially written invalidation generation was accepted as complete")
+	}
+}
+
+// TestInvalidateIsVisibleWhileWritersDrain covers taking generationMu before
+// publishing the stale marker. One unrelated slow Store could hold its read
+// side and leave the successfully mutated representation visible as a fresh
+// HIT until that write completed.
+func TestInvalidateIsVisibleWhileWritersDrain(t *testing.T) {
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
+	defer func() { _ = c.Close() }()
+	const key = "GET:http://example.org/mutated"
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("old"), http.Header{}), key); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model an unrelated Store that is already active.
+	c.generationMu.RLock()
+	locked := true
+	done := make(chan struct{})
+	go func() {
+		c.Invalidate(key)
+		close(done)
+	}()
+	defer func() {
+		if locked {
+			c.generationMu.RUnlock()
+		}
+		<-done
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		if at, ok := c.StaleAt(key); ok {
+			if !at.Equal(invalidationBarrierTime) {
+				t.Fatalf("marker while writer is active = %s, want barrier", at)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("invalidation did not become visible while an active writer held generationMu")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	select {
+	case <-done:
+		t.Fatal("Invalidate completed before the active writer was released")
+	default:
+	}
+	res, err := c.Retrieve(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsStale() {
+		t.Error("pre-mutation representation remained fresh while Invalidate waited for a writer")
+	}
+	_ = res.Close()
+
+	c.generationMu.RUnlock()
+	locked = false
+	<-done
+}
+
+// TestInterruptedInvalidationBarrierRecoversOnRestart covers a process dying
+// after the visible barrier was persisted but before active writers drained.
+// No writer survives a process restart, so startup turns the barrier into its
+// own timestamp and persists that final marker.
+func TestInterruptedInvalidationBarrierRecoversOnRestart(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	fs := vfs.Memory()
+	config := DefaultCacheConfig().WithCleanupInterval(0)
+	const key = "GET:http://example.org/interrupted"
+	first := NewVFSCacheWithConfig(fs, config).(*cache)
+	if err := first.Store(NewResourceBytes(http.StatusOK, []byte("old"), http.Header{}), key); err != nil {
+		t.Fatal(err)
+	}
+	first.staleMutex.Lock()
+	first.stale[key] = invalidationBarrierTime
+	first.persistStale(first.snapshotStaleLocked())
+	first.staleMutex.Unlock()
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(time.Second)
+	second := NewVFSCacheWithConfig(fs, config).(*cache)
+	defer func() { _ = second.Close() }()
+	if at, ok := second.StaleAt(key); !ok || !at.Equal(now) {
+		t.Fatalf("recovered marker = (%s, %v), want restart time %s", at, ok, now)
+	}
+	res, err := second.Retrieve(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Close() }()
+	if !res.IsStale() {
+		t.Error("pre-mutation entry was fresh after recovering an interrupted invalidation")
 	}
 }
 

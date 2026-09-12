@@ -109,11 +109,10 @@ type cache struct {
 	// does not expose; custom VFS backends use the two-slot journal instead.
 	diskRoot string
 
-	// generationMu orders complete stores/freshens against invalidations.
-	// A writer that started before a mutation must finish before the marker is
-	// installed; one that starts afterwards sees the marker before touching
-	// any key. This closes the check-to-write window without holding the stale
-	// map mutex over filesystem I/O.
+	// generationMu orders complete stores/freshens against the FINAL timestamp
+	// of an invalidation. Invalidate first installs a visible barrier marker,
+	// then waits here for older writers before replacing it with the timestamp
+	// that permanently judges their stored generations.
 	generationMu sync.RWMutex
 
 	// stale map with mutex protection
@@ -547,6 +546,27 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 
 func (c *cache) Invalidate(keys ...string) {
 	debugf("invalidating %q", keys)
+	if len(keys) == 0 {
+		return
+	}
+
+	// Publish and persist an immediately visible barrier BEFORE waiting for
+	// active stores. Retrieve does not take generationMu, so acquiring its write
+	// side first left a successful mutation invisible for the entire duration of
+	// an unrelated slow cache write. The far-future value conservatively marks
+	// every currently writable generation stale; if the process dies while
+	// waiting, loadStale recovers it to the restart time, after all writes that
+	// could have survived that process.
+	c.staleMutex.Lock()
+	for _, key := range keys {
+		c.stale[key] = invalidationBarrierTime
+	}
+	c.persistStale(c.snapshotStaleLocked())
+	c.staleMutex.Unlock()
+
+	// Existing stores may already have passed their stale check. Wait until
+	// their stored timestamps are fixed, while the barrier keeps lookups from
+	// treating those later file writes as post-mutation responses.
 	c.generationMu.Lock()
 	defer c.generationMu.Unlock()
 
@@ -575,6 +595,10 @@ func (c *cache) Invalidate(keys ...string) {
 // snapshot path. The other entries live under hashed-key prefixes, so it
 // cannot collide with one.
 const staleMapPath = "stale-markers.json"
+
+// invalidationBarrierTime is persisted while Invalidate waits for writers
+// that were already active. It must be JSON/RFC3339 representable.
+var invalidationBarrierTime = time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC)
 
 // staleSnapshot is the bounded two-slot journal used when all that is known
 // about a caller-provided VFS is the small vfs.VFS interface. That interface
@@ -660,8 +684,10 @@ func (c *cache) loadStale() {
 			}
 		}
 		if found {
-			c.restoreStale(best.Markers)
 			c.staleGeneration = best.Generation
+			if c.restoreStale(best.Markers) {
+				c.persistRestoredStale()
+			}
 			return
 		}
 	}
@@ -676,7 +702,9 @@ func (c *cache) loadStale() {
 		}
 		return
 	}
-	c.restoreStale(restored)
+	if c.restoreStale(restored) {
+		c.persistRestoredStale()
+	}
 }
 
 func (c *cache) readStaleJSON(path string, dst interface{}) error {
@@ -688,10 +716,18 @@ func (c *cache) readStaleJSON(path string, dst interface{}) error {
 	return json.NewDecoder(f).Decode(dst)
 }
 
-func (c *cache) restoreStale(restored map[string]time.Time) {
+// restoreStale merges a snapshot and returns whether it recovered an
+// invalidation that was interrupted while waiting for active writers.
+func (c *cache) restoreStale(restored map[string]time.Time) bool {
+	recovered := false
+	recoveredAt := Clock()
 	c.staleMutex.Lock()
 	defer c.staleMutex.Unlock()
 	for key, at := range restored {
+		if at.Equal(invalidationBarrierTime) {
+			at = recoveredAt
+			recovered = true
+		}
 		// Never overwrite a marker this process has already written: it is
 		// newer than anything on disk.
 		if _, ok := c.stale[key]; !ok {
@@ -699,6 +735,16 @@ func (c *cache) restoreStale(restored map[string]time.Time) {
 		}
 	}
 	debugf("restored %d invalidation marker(s)", len(restored))
+	return recovered
+}
+
+// persistRestoredStale replaces a recovered barrier with the restart time.
+// No writer from the previous process can still be active, so that time is a
+// final upper bound for every cache file that survived it.
+func (c *cache) persistRestoredStale() {
+	c.staleMutex.Lock()
+	defer c.staleMutex.Unlock()
+	c.persistStale(c.snapshotStaleLocked())
 }
 
 // StaleAt returns when key was invalidated, if it was.

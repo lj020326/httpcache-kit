@@ -1099,6 +1099,13 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	if u.Scheme != "" && !originForm {
 		target.Scheme = u.Scheme
 	}
+	if u.Host != "" && !originForm {
+		// Origin equivalence does not imply identical URL spelling. Preserve an
+		// explicitly written default port so the invalidation key is identical
+		// to a direct absolute-form request for the URI named by Location.
+		target.Host = u.Host
+		target.User = u.User
+	}
 	target.Path = ref.Path
 	target.RawPath = ref.RawPath
 	// RFC 3986 treats an authority with an empty path as "/" for HTTP. Once

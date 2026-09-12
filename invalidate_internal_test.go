@@ -379,6 +379,23 @@ func TestInvalidationOriginNormalizesDefaultPorts(t *testing.T) {
 	if u := cr.sameOriginURL("http://example.org:8080/item"); u != nil {
 		t.Fatalf("different effective port target = %#v, want nil", u)
 	}
+
+	absolute := httptest.NewRequest("POST", "http://example.org/objects", nil)
+	absoluteRequest, err := newCacheRequest(absolute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := absoluteRequest.sameOriginURL("http://example.org:80/item")
+	if target == nil {
+		t.Fatal("absolute-form default-port target was treated as cross-origin")
+	}
+	if target.Host != "example.org:80" {
+		t.Fatalf("target authority = %q, want example.org:80", target.Host)
+	}
+	direct := httptest.NewRequest("GET", "http://example.org:80/item", nil)
+	if got, want := NewKey("GET", target, absolute.Header).String(), NewRequestKey(direct).String(); got != want {
+		t.Errorf("invalidation key = %q, direct target key = %q", got, want)
+	}
 }
 
 // TestAbsoluteInvalidationTargetMatchesOriginFormRequest is the regression
