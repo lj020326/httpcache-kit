@@ -266,6 +266,19 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 				h.passUpstream(rw, cReq, nil)
 				return
 			}
+			// Invalidate publishes its barrier before it waits for an active
+			// Freshen's generation read lock. The marker can therefore advance
+			// after Freshen's initial check but before its header write returns.
+			// Recheck the validation START time now; the later header timestamp
+			// is not proof that a request begun before that mutation is current.
+			for _, key := range keys {
+				if staleAt, marked := h.staleAt(key); marked && !res.ReceivedAfter(staleAt) {
+					h.debugf("validation for %q was superseded after freshening by invalidation at %s", key, staleAt)
+					_ = res.Close()
+					h.passUpstream(rw, cReq, nil)
+					return
+				}
+			}
 			// Validator records the precise instant at which the conditional
 			// request began. cReq.Time predates cache lookup and can therefore
 			// precede a concurrent mutation even though validation itself began

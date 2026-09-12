@@ -3,6 +3,7 @@ package httpcache
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -10,6 +11,28 @@ import (
 
 	"github.com/soulteary/vfs-kit"
 )
+
+type blockingSecondHeaderOpenVFS struct {
+	vfs.VFS
+	headerOpens int
+	entered     chan struct{}
+	release     chan struct{}
+}
+
+func (v *blockingSecondHeaderOpenVFS) OpenFile(path string, flag int, perm os.FileMode) (vfs.WFile, error) {
+	f, err := v.VFS.OpenFile(path, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(path, "header/") {
+		v.headerOpens++
+		if v.headerOpens == 2 {
+			close(v.entered)
+			<-v.release
+		}
+	}
+	return f, nil
+}
 
 // TestInvalidationKeys covers the key set RFC 7234 section 4.4 requires a
 // successful unsafe request to invalidate.
@@ -105,6 +128,7 @@ func TestUnsafeRequestInvalidatesCachedGET(t *testing.T) {
 	}
 
 	do("GET", "http://example.org/thing") // MISS, stores
+	h.writes.Wait()
 	before := upstreamHits
 	do("GET", "http://example.org/thing") // HIT, must not reach upstream
 	if upstreamHits != before {
@@ -1203,5 +1227,108 @@ func TestSuccessfulValidationClearsStaleWarning(t *testing.T) {
 	}
 	if warning := rec.Header().Values("Warning"); len(warning) != 0 {
 		t.Fatalf("successfully validated response carried stale warning: %q", warning)
+	}
+}
+
+func TestValidationRefetchesWhenInvalidatedDuringFreshen(t *testing.T) {
+	fs := &blockingSecondHeaderOpenVFS{
+		VFS:     vfs.Memory(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(fs.release)
+		}
+	}()
+	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
+	defer func() { _ = c.Close() }()
+	req := httptest.NewRequest(http.MethodGet, "http://example.org/freshen-race", nil)
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatalf("newCacheRequest: %v", err)
+	}
+	key := cReq.Key.String()
+	headers := http.Header{
+		"Cache-Control": {"max-age=3600"},
+		"Date":          {time.Now().UTC().Format(http.TimeFormat)},
+		"ETag":          {`"v1"`},
+	}
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("before"), headers.Clone()), key); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	c.Invalidate(key)
+
+	var upstreamCalls atomic.Int32
+	var changed atomic.Bool
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		for name, values := range headers {
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+		if r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		if changed.Load() {
+			_, _ = w.Write([]byte("after"))
+			return
+		}
+		_, _ = w.Write([]byte("before"))
+	})
+	h := NewHandler(c, upstream)
+	done := make(chan struct{})
+	rec := httptest.NewRecorder()
+	go func() {
+		defer close(done)
+		h.ServeHTTP(rec, req)
+	}()
+
+	select {
+	case <-fs.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Freshen did not reach the blocked header write")
+	}
+	changed.Store(true)
+	invalidated := make(chan struct{})
+	go func() {
+		c.Invalidate(key)
+		close(invalidated)
+	}()
+
+	deadline := time.After(time.Second)
+	for {
+		if at, ok := c.StaleAt(key); ok && at.Equal(invalidationBarrierTime) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("second invalidation did not publish its barrier")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	close(fs.release)
+	released = true
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after releasing Freshen")
+	}
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		t.Fatal("second invalidation did not finish")
+	}
+	h.writes.Wait()
+
+	if got := rec.Body.String(); got != "after" {
+		t.Fatalf("body = %q, want full refetch after", got)
+	}
+	if got := upstreamCalls.Load(); got != 2 {
+		t.Fatalf("upstream calls = %d, want validation plus full refetch", got)
 	}
 }
