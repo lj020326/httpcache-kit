@@ -394,7 +394,21 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 	}()
 	rw.WaitHeaders()
 
-	if r.Method != "HEAD" && !r.isStateChanging() {
+	if r.isStateChanging() {
+		// A mutation's status and invalidation headers are complete as soon as
+		// WriteHeader returns. Do not wait for its body: an upstream may stream
+		// that body for a long time after the successful status is already
+		// visible to the client, and concurrent GETs must not see the old
+		// representation throughout that interval.
+		res := NewResourceBytes(rw.StatusCode, nil, rw.responseHeader)
+		if res.IsNonErrorStatus() {
+			h.invalidateResource(res, r)
+		}
+		_, _ = io.Copy(io.Discard, rdr)
+		return
+	}
+
+	if r.Method != "HEAD" {
 		// responseStreamer writes to the pipe before it writes to the client.
 		// Keep consuming the pipe until the upstream handler finishes; closing
 		// the reader as soon as headers arrive makes a handler whose first call
@@ -406,11 +420,7 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 	res := rw.Resource()
 	defer func() { _ = res.Close() }()
 
-	if r.Method == "HEAD" {
-		_ = h.cache.Freshen(res, r.Key.ForMethod("GET").String())
-	} else if res.IsNonErrorStatus() {
-		h.invalidateResource(res, r)
-	}
+	_ = h.cache.Freshen(res, r.Key.ForMethod("GET").String())
 }
 
 // passUpstream makes the request via the upstream handler and stores the result
@@ -712,8 +722,8 @@ func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
 	// unsafe request had already been answered while the previous
 	// representation was still considered fresh, so an immediate or concurrent
 	// GET could be served stale content after a successful mutation.
-	h.cache.Invalidate(keys...)
 	h.recordStale(keys...)
+	h.cache.Invalidate(keys...)
 	h.debugf("invalidated %d key(s) after %s %s: %q", len(keys), r.Method, r.URL, keys)
 }
 
@@ -1258,6 +1268,9 @@ type responseStreamer struct {
 	http.ResponseWriter
 	pipeReader *io.PipeReader
 	pipeWriter *io.PipeWriter
+	// responseHeader is the immutable header snapshot that was committed with
+	// StatusCode. It is published by closing C, so WaitHeaders observes both.
+	responseHeader http.Header
 	// C is closed by WriteHeader to signal the headers' writing. headerOnce ensures it is closed at most once.
 	C          chan struct{}
 	headerOnce sync.Once
@@ -1274,6 +1287,7 @@ func (rw *responseStreamer) WaitHeaders() {
 func (rw *responseStreamer) WriteHeader(status int) {
 	rw.headerOnce.Do(func() {
 		rw.StatusCode = status
+		rw.responseHeader = rw.ResponseWriter.Header().Clone()
 		rw.ResponseWriter.WriteHeader(status)
 		close(rw.C)
 	})
@@ -1315,14 +1329,18 @@ func (rw *responseStreamer) NextReader() (io.ReadCloser, error) {
 // Resource returns a copy of the responseStreamer as a Resource object
 func (rw *responseStreamer) Resource() *Resource {
 	b, err := io.ReadAll(rw.pipeReader)
+	header := rw.responseHeader
+	if header == nil {
+		header = rw.Header().Clone()
+	}
 	if err != nil {
 		return &Resource{
-			header:         rw.Header(),
+			header:         header,
 			statusCode:     rw.StatusCode,
 			ReadSeekCloser: errReadSeekCloser{err},
 		}
 	}
-	return NewResourceBytes(rw.StatusCode, b, rw.Header())
+	return NewResourceBytes(rw.StatusCode, b, header)
 }
 
 type errReadSeekCloser struct {

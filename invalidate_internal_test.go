@@ -124,6 +124,82 @@ func TestUnsafeRequestInvalidatesCachedGET(t *testing.T) {
 	}
 }
 
+// TestUnsafeRequestInvalidatesBeforeBodyCompletes covers waiting for
+// responseStreamer.Resource to drain an unsafe response before invalidating.
+// A successful status is already visible to the client at that point, and a
+// slow or streaming mutation body must not leave the old representation fresh.
+func TestUnsafeRequestInvalidatesBeforeBodyCompletes(t *testing.T) {
+	statusWritten := make(chan struct{})
+	releaseBody := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseBody:
+		default:
+			close(releaseBody)
+		}
+	}()
+
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != "GET" {
+			close(statusWritten)
+			<-releaseBody
+		}
+		_, _ = w.Write([]byte("body"))
+	})
+
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
+	defer func() { _ = c.Close() }()
+	h := NewHandler(c, upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	target := "http://example.org/slow-mutation"
+	seed := httptest.NewRecorder()
+	h.ServeHTTP(seed, httptest.NewRequest("GET", target, nil))
+	h.writes.Wait()
+
+	mutationDone := make(chan struct{})
+	go func() {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", target, nil))
+		close(mutationDone)
+	}()
+
+	select {
+	case <-statusWritten:
+	case <-time.After(time.Second):
+		t.Fatal("mutation did not publish its response status")
+	}
+
+	key := NewRequestKey(httptest.NewRequest("GET", target, nil)).String()
+	deadline := time.After(time.Second)
+	for {
+		if at, ok := c.StaleAt(key); ok && !at.IsZero() {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("mutation remained unmarked while its response body was blocked")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	res, err := c.Retrieve(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsStale() {
+		t.Error("cached representation remained fresh after the mutation status was published")
+	}
+	_ = res.Close()
+
+	close(releaseBody)
+	select {
+	case <-mutationDone:
+	case <-time.After(time.Second):
+		t.Fatal("mutation did not finish after its body was released")
+	}
+}
+
 // --- Codex review follow-ups (PR #5) ---
 
 // TestInvalidationCoversVaryVariants is the regression test for invalidation

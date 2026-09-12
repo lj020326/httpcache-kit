@@ -110,9 +110,11 @@ type cache struct {
 	diskRoot string
 
 	// generationMu orders complete stores/freshens against the FINAL timestamp
-	// of an invalidation. Invalidate first installs a visible barrier marker,
-	// then waits here for older writers before replacing it with the timestamp
-	// that permanently judges their stored generations.
+	// of an invalidation. It also keeps retrievals from straddling cleanup's
+	// removal of an expired file and the marker that governs it. Invalidate
+	// first installs a visible barrier marker, then waits here for older
+	// operations before replacing it with the timestamp that permanently judges
+	// their stored generations.
 	generationMu sync.RWMutex
 
 	// stale map with mutex protection
@@ -132,9 +134,10 @@ type cache struct {
 	statMutex sync.RWMutex
 
 	// Cleanup control
-	stopChan  chan struct{}
-	stopped   bool
-	closeOnce sync.Once
+	stopChan    chan struct{}
+	cleanupDone chan struct{}
+	stopped     bool
+	closeOnce   sync.Once
 }
 
 var _ Cache = (*cache)(nil)
@@ -162,13 +165,14 @@ func newVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig, diskRoot string) Ext
 	config.Validate()
 
 	c := &cache{
-		fs:       fs,
-		config:   config,
-		diskRoot: diskRoot,
-		stale:    make(map[string]time.Time),
-		lruList:  list.New(),
-		lruIndex: make(map[string]*cacheEntry),
-		stopChan: make(chan struct{}),
+		fs:          fs,
+		config:      config,
+		diskRoot:    diskRoot,
+		stale:       make(map[string]time.Time),
+		lruList:     list.New(),
+		lruIndex:    make(map[string]*cacheEntry),
+		stopChan:    make(chan struct{}),
+		cleanupDone: make(chan struct{}),
 	}
 
 	// A caller may supply a persistent or deliberately reused VFS. Restore it
@@ -183,6 +187,8 @@ func newVFSCacheWithConfig(fs vfs.VFS, config *CacheConfig, diskRoot string) Ext
 	// Start cleanup goroutine if interval is configured
 	if config.CleanupInterval > 0 {
 		go c.cleanupLoop()
+	} else {
+		close(c.cleanupDone)
 	}
 
 	return c
@@ -500,6 +506,13 @@ func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.T
 
 // Retrieve returns a cached Resource for the given key
 func (c *cache) Retrieve(key string) (*Resource, error) {
+	// Cleanup removes an expired entry and its invalidation marker as one
+	// generation transition. Holding the read side from file open through the
+	// marker check means a retrieval either observes the old file WITH its
+	// marker, or starts after cleanup and cannot open the file at all.
+	c.generationMu.RLock()
+	defer c.generationMu.RUnlock()
+
 	hashedKey := hashKey(key)
 	bodyPath := bodyPrefix + formatPrefix + hashedKey
 	f, err := c.fs.Open(bodyPath)
@@ -1016,6 +1029,7 @@ func (c *cache) evictIfNeeded(additionalSize int64) {
 func (c *cache) cleanupLoop() {
 	ticker := time.NewTicker(c.config.CleanupInterval)
 	defer ticker.Stop()
+	defer close(c.cleanupDone)
 
 	for {
 		select {
@@ -1036,15 +1050,19 @@ func (c *cache) Cleanup() CleanupResult {
 	start := Clock()
 	result := CleanupResult{}
 
-	// Clean up stale map entries
-	result.RemovedStaleEntries = c.cleanupStaleMap()
-
-	// Clean up TTL-expired entries
+	// Remove TTL-expired entries before their invalidation markers. The marker
+	// is the only durable evidence that an older file is stale; publishing its
+	// removal first creates a fresh-read window and lets a crash restore the
+	// old file without its marker. Use one cutoff instant for both sweeps so a
+	// boundary entry cannot fall between them as cleanup runs.
+	c.generationMu.Lock()
 	if c.config.TTL > 0 {
-		removed, bytes := c.cleanupTTLExpired()
+		removed, bytes := c.cleanupTTLExpired(start)
 		result.RemovedItems += removed
 		result.RemovedBytes += bytes
 	}
+	result.RemovedStaleEntries = c.cleanupStaleMap(start)
+	c.generationMu.Unlock()
 
 	// Enforce size limit
 	if c.config.MaxSize > 0 {
@@ -1070,8 +1088,9 @@ func (c *cache) Cleanup() CleanupResult {
 //
 // The marker is the ONLY record that entries older than it are pre-mutation,
 // so dropping it while such an entry survives republishes that entry as a HIT.
-// removeEntry already drops a marker when its entry is evicted; this covers
-// the age-based sweep, which knows nothing about what is still stored.
+// This age-based sweep is deliberately ordered after TTL eviction, because
+// removeEntry cannot discard a base marker while older Vary variants may
+// still depend on it.
 //
 // StaleMapTTL alone did not: its 24 hour default against the 7 day cache TTL
 // left six days in which an infrequently requested representation -- a Vary
@@ -1091,7 +1110,7 @@ func (c *cache) staleRetention() time.Duration {
 }
 
 // cleanupStaleMap removes old stale map entries
-func (c *cache) cleanupStaleMap() int {
+func (c *cache) cleanupStaleMap(now time.Time) int {
 	retention := c.staleRetention()
 	if retention <= 0 {
 		return 0
@@ -1100,7 +1119,7 @@ func (c *cache) cleanupStaleMap() int {
 	c.staleMutex.Lock()
 	defer c.staleMutex.Unlock()
 
-	cutoff := Clock().Add(-retention)
+	cutoff := now.Add(-retention)
 	removed := 0
 
 	for key, staleTime := range c.stale {
@@ -1123,11 +1142,11 @@ func (c *cache) cleanupStaleMap() int {
 }
 
 // cleanupTTLExpired removes items that have exceeded their TTL
-func (c *cache) cleanupTTLExpired() (int, int64) {
+func (c *cache) cleanupTTLExpired(now time.Time) (int, int64) {
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
-	cutoff := Clock().Add(-c.config.TTL)
+	cutoff := now.Add(-c.config.TTL)
 	removed := 0
 	var bytesRemoved int64
 
@@ -1256,6 +1275,10 @@ func (c *cache) Close() error {
 	c.closeOnce.Do(func() {
 		c.stopped = true
 		close(c.stopChan)
+		// Closing stopChan only requests shutdown. Join the cleanup loop so a
+		// caller may safely release shared dependencies (including Clock in
+		// tests) when Close returns.
+		<-c.cleanupDone
 	})
 	return nil
 }

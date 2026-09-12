@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -368,6 +369,136 @@ func TestCleanupLoop_Runs(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	result := cache.Cleanup()
 	_ = result
+}
+
+type blockingRemoveVFS struct {
+	vfs.VFS
+	enabled bool
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingRemoveVFS) Remove(path string) error {
+	if b.enabled {
+		b.once.Do(func() {
+			close(b.entered)
+			<-b.release
+		})
+	}
+	return b.VFS.Remove(path)
+}
+
+// TestCleanupRemovesExpiredEntryBeforeMarker verifies that cleanup never
+// publishes marker removal while the pre-invalidation files are still being
+// evicted. Otherwise a concurrent read, or a restart at that point, can treat
+// the old representation as fresh.
+func TestCleanupRemovesExpiredEntryBeforeMarker(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	fs := &blockingRemoveVFS{
+		VFS:     vfs.Memory(),
+		entered: make(chan struct{}),
+		release: release,
+	}
+	config := DefaultCacheConfig().
+		WithTTL(time.Hour).
+		WithStaleMapTTL(time.Hour).
+		WithCleanupInterval(0)
+	c := NewVFSCacheWithConfig(fs, config).(*cache)
+	defer func() { _ = c.Close() }()
+
+	const key = "cleanup-order"
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("old"), http.Header{}), key); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	c.Invalidate(key)
+	now = now.Add(2 * time.Hour)
+	fs.enabled = true
+
+	done := make(chan CleanupResult, 1)
+	go func() { done <- c.Cleanup() }()
+	select {
+	case <-fs.entered:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not begin evicting the expired entry")
+	}
+	if _, ok := c.StaleAt(key); !ok {
+		t.Error("invalidation marker was removed before its expired entry")
+	}
+
+	unblock()
+	select {
+	case result := <-done:
+		if result.RemovedItems != 1 || result.RemovedStaleEntries != 1 {
+			t.Errorf("cleanup result = %+v, want one item and one marker removed", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not finish after filesystem removal resumed")
+	}
+	if _, ok := c.StaleAt(key); ok {
+		t.Error("expired marker remained after its governed entry was removed")
+	}
+}
+
+// TestCloseWaitsForCleanupLoop makes Close's join guarantee observable: the
+// periodic loop is held inside a filesystem removal and Close must not return
+// until that cleanup exits.
+func TestCloseWaitsForCleanupLoop(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	fs := &blockingRemoveVFS{
+		VFS:     vfs.Memory(),
+		enabled: true,
+		entered: make(chan struct{}),
+		release: release,
+	}
+	config := DefaultCacheConfig().
+		WithTTL(time.Nanosecond).
+		WithCleanupInterval(time.Millisecond)
+	c := NewVFSCacheWithConfig(fs, config).(*cache)
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("old"), http.Header{}), "close-join"); err != nil {
+		unblock()
+		_ = c.Close()
+		t.Fatal(err)
+	}
+
+	select {
+	case <-fs.entered:
+	case <-time.After(time.Second):
+		unblock()
+		_ = c.Close()
+		t.Fatal("cleanup loop did not enter filesystem removal")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		_ = c.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		unblock()
+		t.Fatal("Close returned while the cleanup goroutine was still running")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	unblock()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after the cleanup goroutine exited")
+	}
 }
 
 func TestCache_Freshen_KeyNotInCache(t *testing.T) {
