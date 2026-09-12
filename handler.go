@@ -1071,10 +1071,12 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 
 func (r *cacheRequest) isStateChanging() bool {
 	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-		return true
-	default:
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
 		return false
+	default:
+		// HTTP invalidation is defined for every unsafe method, including
+		// extension methods such as WebDAV PROPPATCH, MKCOL, and MOVE.
+		return true
 	}
 }
 

@@ -33,10 +33,14 @@ const (
 	bodyPrefix   = "body/"
 	formatPrefix = "v1/"
 
-	// storedAtHeader persists the cache's full-precision local write or
-	// validation time in the on-disk header record. It is removed before a
-	// Header or Resource is returned, so it never reaches callers.
-	storedAtHeader = "X-Httpcache-Internal-Stored-At"
+	// storedAtPreamble persists the cache's full-precision local write or
+	// validation time before the serialized HTTP response. Keeping metadata
+	// outside the response header namespace means no origin field can collide
+	// with it.
+	storedAtPreamble = "HTTPCACHE/1 "
+	// legacyStoredAtHeader is read only for disk entries written by an earlier
+	// PR revision. New entries preserve an origin's field with this name.
+	legacyStoredAtHeader = "X-Httpcache-Internal-Stored-At"
 )
 
 // Returned when a resource doesn't exist
@@ -360,10 +364,8 @@ func (c *cache) Header(key string) (Header, error) {
 	return h, err
 }
 
-// readHeaderFile reads a stored response header and extracts the cache's
-// private full-precision timestamp. The private field is deleted before the
-// Header is returned so it cannot leak into a served response or participate
-// in HTTP header comparisons.
+// readHeaderFile reads a stored response header and its separate cache
+// metadata preamble.
 func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	f, err := c.fs.Open(path)
 	if err != nil {
@@ -374,17 +376,19 @@ func (c *cache) readHeaderFile(path, key string) (Header, time.Time, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	h, err := readHeaders(bufio.NewReader(f))
+	h, storedAt, err := readStoredHeaders(bufio.NewReader(f))
 	if err != nil {
 		return Header{}, time.Time{}, fmt.Errorf("failed to read headers from %q for key %q: %w", path, key, err)
 	}
 
-	var storedAt time.Time
-	if raw := h.Get(storedAtHeader); raw != "" {
+	// Backward compatibility for entries written while the timestamp lived in
+	// a private-looking HTTP field. A new-format preamble is authoritative and
+	// leaves a legitimate origin field of the same name untouched.
+	if raw := h.Get(legacyStoredAtHeader); storedAt.IsZero() && raw != "" {
 		if parsed, parseErr := time.Parse(time.RFC3339Nano, raw); parseErr == nil {
 			storedAt = parsed
+			h.Del(legacyStoredAtHeader)
 		}
-		h.Del(storedAtHeader)
 	}
 	return h, storedAt, nil
 }
@@ -486,14 +490,10 @@ func (c *cache) storeBody(r io.Reader, key string) (int64, error) {
 }
 
 func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.Time) (int64, error) {
-	storedHeader := h.Clone()
-	if storedHeader == nil {
-		storedHeader = make(http.Header)
-	}
-	storedHeader.Set(storedAtHeader, storedAt.UTC().Format(time.RFC3339Nano))
 	hb := &bytes.Buffer{}
+	fmt.Fprintf(hb, "%s%s\r\n", storedAtPreamble, storedAt.UTC().Format(time.RFC3339Nano))
 	fmt.Fprintf(hb, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
-	if err := headersToWriter(storedHeader, hb); err != nil {
+	if err := headersToWriter(h, hb); err != nil {
 		return 0, fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
 	}
 	n, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(hb.Bytes()))
@@ -715,27 +715,44 @@ func hashKey(key string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func readHeaders(r *bufio.Reader) (Header, error) {
+func readStoredHeaders(r *bufio.Reader) (Header, time.Time, error) {
 	tp := textproto.NewReader(r)
 	line, err := tp.ReadLine()
 	if err != nil {
-		return Header{}, err
+		return Header{}, time.Time{}, err
+	}
+
+	var storedAt time.Time
+	if strings.HasPrefix(line, storedAtPreamble) {
+		storedAt, err = time.Parse(time.RFC3339Nano, strings.TrimPrefix(line, storedAtPreamble))
+		if err != nil {
+			return Header{}, time.Time{}, fmt.Errorf("malformed cache timestamp: %w", err)
+		}
+		line, err = tp.ReadLine()
+		if err != nil {
+			return Header{}, time.Time{}, err
+		}
 	}
 
 	f := strings.SplitN(line, " ", 3)
 	if len(f) < 2 {
-		return Header{}, fmt.Errorf("malformed HTTP response: %s", line)
+		return Header{}, time.Time{}, fmt.Errorf("malformed HTTP response: %s", line)
 	}
 	statusCode, err := strconv.Atoi(f[1])
 	if err != nil {
-		return Header{}, fmt.Errorf("malformed HTTP status code: %s", f[1])
+		return Header{}, time.Time{}, fmt.Errorf("malformed HTTP status code: %s", f[1])
 	}
 
 	mimeHeader, err := tp.ReadMIMEHeader()
 	if err != nil {
-		return Header{}, err
+		return Header{}, time.Time{}, err
 	}
-	return Header{StatusCode: statusCode, Header: http.Header(mimeHeader)}, nil
+	return Header{StatusCode: statusCode, Header: http.Header(mimeHeader)}, storedAt, nil
+}
+
+func readHeaders(r *bufio.Reader) (Header, error) {
+	h, _, err := readStoredHeaders(r)
+	return h, err
 }
 
 func headersToWriter(h http.Header, w io.Writer) error {

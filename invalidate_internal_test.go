@@ -78,8 +78,9 @@ func TestInvalidationKeys(t *testing.T) {
 }
 
 // TestUnsafeRequestInvalidatesCachedGET is the end-to-end regression test:
-// invalidateResource used to only log, so a resource that had been POSTed to
-// kept being served from cache without revalidation.
+// invalidateResource used to only log, and later recognized just four common
+// mutation methods, so a resource changed by an unsafe extension method kept
+// being served from cache without revalidation.
 func TestUnsafeRequestInvalidatesCachedGET(t *testing.T) {
 	var upstreamHits int
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -112,12 +113,12 @@ func TestUnsafeRequestInvalidatesCachedGET(t *testing.T) {
 	// before the unsafe request's ServeHTTP returns. Waiting on the write
 	// group masked the window in which the mutation had been answered while
 	// the previous representation was still considered fresh.
-	do("POST", "http://example.org/thing")
+	do("PROPPATCH", "http://example.org/thing")
 
 	hitsBeforeFinalGet := upstreamHits
 	do("GET", "http://example.org/thing")
 	if upstreamHits == hitsBeforeFinalGet {
-		t.Error("GET after POST was served from cache without revalidation; the entry was never invalidated")
+		t.Error("GET after PROPPATCH was served from cache without revalidation; the entry was never invalidated")
 	}
 }
 

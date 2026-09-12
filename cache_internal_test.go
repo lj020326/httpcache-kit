@@ -627,6 +627,40 @@ func TestAtomicWriteFilePreservesPreviousSnapshot(t *testing.T) {
 	}
 }
 
+// TestStoredAtMetadataPreservesOriginHeader is the regression test for using
+// a private-looking HTTP field as cache metadata. An origin is allowed to use
+// that name; overwriting it on disk and deleting it on read made HIT responses
+// differ from the original MISS.
+func TestStoredAtMetadataPreservesOriginHeader(t *testing.T) {
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	defer func() { _ = c.Close() }()
+
+	const key = "GET:http://example.org/origin-header"
+	const value = "origin-owned-value"
+	res := NewResourceBytes(http.StatusOK, []byte("body"), http.Header{
+		legacyStoredAtHeader: {value},
+	})
+	if err := c.Store(res, key); err != nil {
+		t.Fatal(err)
+	}
+
+	h, err := c.Header(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.Get(legacyStoredAtHeader); got != value {
+		t.Errorf("cached origin header = %q, want %q", got, value)
+	}
+	got, err := c.Retrieve(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = got.Close() }()
+	if valueAfterHit := got.Header().Get(legacyStoredAtHeader); valueAfterHit != value {
+		t.Errorf("origin header after cache HIT = %q, want %q", valueAfterHit, value)
+	}
+}
+
 // headerFailAfterFirstVFS: OpenFile for header/ path succeeds first time, fails second (for Freshen storeHeader).
 type headerFailAfterFirstVFS struct {
 	vfs.VFS
