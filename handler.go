@@ -271,6 +271,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			// precede a concurrent mutation even though validation itself began
 			// after it.
 			h.recordFresh(res.RequestTime, keys...)
+			// lookup marked this in-memory Resource stale before validation.
+			// Freshen advances the persisted generation, but it cannot clear the
+			// flag on the object we are about to serve; do that only after the
+			// ordered Freshen succeeds so Warning: 110 is not emitted for a
+			// response just validated against the origin.
+			res.markFresh()
 		} else {
 			h.debugf("response is changed")
 			_ = res.Close()

@@ -1159,3 +1159,49 @@ func TestRevalidatedVariantStopsRevalidating(t *testing.T) {
 		t.Errorf("%d further upstream request(s) after a successful revalidation, want 0", got)
 	}
 }
+
+func TestSuccessfulValidationClearsStaleWarning(t *testing.T) {
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	defer func() { _ = c.Close() }()
+	req := httptest.NewRequest(http.MethodGet, "http://example.org/validated-warning", nil)
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatalf("newCacheRequest: %v", err)
+	}
+	headers := http.Header{
+		"Cache-Control": {"max-age=3600"},
+		"Date":          {time.Now().UTC().Format(http.TimeFormat)},
+		"ETag":          {`"v1"`},
+	}
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("cached"), headers.Clone()), cReq.Key.String()); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	c.Invalidate(cReq.Key.String())
+
+	var validations atomic.Int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		validations.Add(1)
+		for name, values := range headers {
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+		w.WriteHeader(http.StatusNotModified)
+	})
+	h := NewHandler(c, upstream)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if got := validations.Load(); got != 1 {
+		t.Fatalf("validation requests = %d, want 1", got)
+	}
+	if got := rec.Body.String(); got != "cached" {
+		t.Fatalf("body = %q, want cached", got)
+	}
+	if got := rec.Header().Get(CacheHeader); got != "HIT" {
+		t.Fatalf("cache status = %q, want HIT", got)
+	}
+	if warning := rec.Header().Values("Warning"); len(warning) != 0 {
+		t.Fatalf("successfully validated response carried stale warning: %q", warning)
+	}
+}

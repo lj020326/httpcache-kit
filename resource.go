@@ -79,6 +79,10 @@ func (r *Resource) MarkStale() {
 	r.stale = true
 }
 
+func (r *Resource) markFresh() {
+	r.stale = false
+}
+
 func (r *Resource) cacheControl() (CacheControl, error) {
 	if r.cc != nil {
 		return r.cc, nil
