@@ -362,6 +362,33 @@ func TestInvalidationKeysPreserveTargetScheme(t *testing.T) {
 	}
 }
 
+// TestAbsoluteInvalidationTargetMatchesOriginFormRequest is the regression
+// test for copying an absolute Location's scheme into an origin-form request
+// URL. That created "http:/item", while a direct request is keyed as "/item",
+// so the representation named by Location remained fresh.
+func TestAbsoluteInvalidationTargetMatchesOriginFormRequest(t *testing.T) {
+	r := httptest.NewRequest("POST", "/objects", nil)
+	r.Host = "example.org"
+	cr, err := newCacheRequest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := cr.sameOriginURL("http://example.org/item")
+	if u == nil {
+		t.Fatal("sameOriginURL returned nil for a same-origin absolute Location")
+	}
+	if u.Scheme != "" || u.Host != "" || u.Path != "/item" {
+		t.Fatalf("target URL = %#v, want origin-form /item", u)
+	}
+
+	direct := httptest.NewRequest("GET", "/item", nil)
+	direct.Host = r.Host
+	if got, want := NewKey("GET", u, r.Header).String(), NewRequestKey(direct).String(); got != want {
+		t.Errorf("invalidation key = %q, direct request key = %q", got, want)
+	}
+}
+
 // TestStaleMarkerOutlivesTheEntriesItJudges is the regression test for sweeping
 // invalidation markers on StaleMapTTL alone. The marker is the only record
 // that entries older than it are pre-mutation, so with the 24 hour default

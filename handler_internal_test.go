@@ -815,7 +815,9 @@ func TestIsCacheable_StatusNotStoreable(t *testing.T) {
 func TestPipeUpstream_NonCacheableRequest(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
-		w.WriteHeader(http.StatusOK)
+		// Deliberately let Write send the headers. pipeUpstream must keep its
+		// pipe reader alive after WaitHeaders returns or this write fails before
+		// responseStreamer can copy the body to the client.
 		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(NewMemoryCache(), upstream)
@@ -829,6 +831,9 @@ func TestPipeUpstream_NonCacheableRequest(t *testing.T) {
 	}
 	if rec.Header().Get(CacheHeader) != "SKIP" {
 		t.Errorf("want X-Cache: SKIP, got %s", rec.Header().Get(CacheHeader))
+	}
+	if got := rec.Body.String(); got != "ok" {
+		t.Errorf("want body %q, got %q", "ok", got)
 	}
 }
 

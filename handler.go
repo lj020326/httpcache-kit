@@ -391,6 +391,11 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 	rw.WaitHeaders()
 
 	if r.Method != "HEAD" && !r.isStateChanging() {
+		// responseStreamer writes to the pipe before it writes to the client.
+		// Keep consuming the pipe until the upstream handler finishes; closing
+		// the reader as soon as headers arrive makes a handler whose first call
+		// is Write fail that write before the client receives its body.
+		_, _ = io.Copy(io.Discard, rdr)
 		return
 	}
 
@@ -1036,7 +1041,13 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	// https://example.org/item" into a key for http://example.org/item --
 	// invalidating an unrelated entry while the representation the origin
 	// actually named stayed fresh.
-	if u.Scheme != "" {
+	// A server normally receives origin-form request targets, where URL has
+	// neither Scheme nor Host and Host lives on the Request itself. Keep that
+	// shape even when Location is absolute: otherwise setting only Scheme
+	// produces "http:/item", a different key from the direct request's
+	// "/item". For absolute-form requests, the target's explicit scheme still
+	// belongs in the key.
+	if u.Scheme != "" && (r.URL.Scheme != "" || r.URL.Host != "") {
 		target.Scheme = u.Scheme
 	}
 	target.Path = ref.Path
