@@ -395,3 +395,156 @@ func TestStaleMarkerOutlivesTheEntriesItJudges(t *testing.T) {
 		t.Error("the pre-mutation entry came back fresh; its invalidation marker was swept out from under it")
 	}
 }
+
+// --- Codex review round 4 (PR #5) ---
+
+// TestBaseMarkerSurvivesBaseEntryEviction is the regression test for deleting
+// the invalidation marker in removeEntry. The base key's marker is what every
+// Vary VARIANT is judged against, and variants are tracked and evicted
+// independently -- so dropping it because LRU eviction happened to take the
+// base entry left the surviving pre-mutation variants with nothing marking
+// them stale.
+func TestBaseMarkerSurvivesBaseEntryEviction(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	defer func() { _ = c.Close() }()
+
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("base"), http.Header{}), "base"); err != nil {
+		t.Fatal(err)
+	}
+	c.Invalidate("base")
+
+	// The base entry is evicted; its marker must remain.
+	inner, ok := c.(*cache)
+	if !ok {
+		t.Fatalf("cache is %T, want *cache", c)
+	}
+	inner.lruMutex.Lock()
+	for _, entry := range inner.lruIndex {
+		_ = inner.removeEntry(entry)
+	}
+	inner.lruMutex.Unlock()
+
+	if _, marked := inner.StaleAt("base"); !marked {
+		t.Error("evicting the base entry removed the marker its Vary variants are judged against")
+	}
+}
+
+// TestInvalidationKeysPreserveForceQuery is the regression test for dropping
+// url.URL.ForceQuery. "/item?" and "/item" are different cache keys to
+// NewRequestKey, and target starts as a clone of the mutation's URL -- so the
+// flag was both lost where it was wanted and inherited where it was not.
+func TestInvalidationKeysPreserveForceQuery(t *testing.T) {
+	plain := httptest.NewRequest("POST", "http://example.org/objects", nil)
+	cr, err := newCacheRequest(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := cr.sameOriginURL("/item?"); u == nil || !u.ForceQuery {
+		t.Errorf("sameOriginURL(%q).ForceQuery = %v, want true", "/item?", u)
+	}
+
+	// And not inherited from the mutation's own URL.
+	forced := httptest.NewRequest("POST", "http://example.org/objects?", nil)
+	cr2, err := newCacheRequest(forced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := cr2.sameOriginURL("/item"); u == nil || u.ForceQuery {
+		t.Errorf("sameOriginURL(%q).ForceQuery = %v, want false", "/item", u)
+	}
+}
+
+// plainCache is a Cache that does NOT implement staleAtChecker, standing in
+// for a third-party implementation. It wraps the built-in one so the only
+// thing missing is the StaleAt capability.
+type plainCache struct {
+	inner Cache
+}
+
+func (c plainCache) Header(key string) (Header, error)         { return c.inner.Header(key) }
+func (c plainCache) Store(res *Resource, keys ...string) error { return c.inner.Store(res, keys...) }
+func (c plainCache) Retrieve(key string) (*Resource, error)    { return c.inner.Retrieve(key) }
+func (c plainCache) Invalidate(keys ...string)                 { c.inner.Invalidate(keys...) }
+func (c plainCache) Freshen(res *Resource, keys ...string) error {
+	return c.inner.Freshen(res, keys...)
+}
+
+// TestInvalidationSurvivesForACacheWithoutStaleAt is the regression test for
+// falling back to the base ENTRY's state when a Cache cannot report
+// invalidation times. Refetching one variant rewrites the base entry, so every
+// other pre-mutation variant became a fresh HIT again -- the exact bug StaleAt
+// closes, left open for third-party caches. The handler keeps its own markers
+// for them now.
+func TestInvalidationSurvivesForACacheWithoutStaleAt(t *testing.T) {
+	var upstreamHits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", "Accept-Language")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	})
+
+	// A controlled clock, because Proxy-Date is second-granular: without
+	// stepping it, the POST and the refetch land in the same second and the
+	// rewritten base entry still looks older than the marker -- which makes
+	// even the broken base-entry fallback appear to work.
+	originalClock := Clock
+	t.Cleanup(func() { Clock = originalClock })
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	h := NewHandler(plainCache{inner: NewMemoryCache()}, upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	if _, ok := h.cache.(staleAtChecker); ok {
+		t.Fatal("the fixture cache implements staleAtChecker; it must not")
+	}
+
+	get := func(lang string) {
+		req := httptest.NewRequest("GET", "http://example.org/thing", nil)
+		req.Header.Set("Accept-Language", lang)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		rec.Flush()
+	}
+
+	get("en")
+	h.writes.Wait()
+	get("fr")
+	h.writes.Wait()
+
+	before := atomic.LoadInt32(&upstreamHits)
+	get("en")
+	get("fr")
+	if atomic.LoadInt32(&upstreamHits) != before {
+		t.Fatal("a variant was not cached")
+	}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "http://example.org/thing", nil))
+	rec.Flush()
+	h.writes.Wait()
+
+	// A clear second later, so the refetched base entry is unambiguously
+	// NEWER than the invalidation.
+	now = now.Add(2 * time.Second)
+
+	before = atomic.LoadInt32(&upstreamHits)
+	get("en")
+	if atomic.LoadInt32(&upstreamHits) == before {
+		t.Fatal("the en variant was served from cache after the POST")
+	}
+	h.writes.Wait()
+
+	before = atomic.LoadInt32(&upstreamHits)
+	get("fr")
+	if atomic.LoadInt32(&upstreamHits) == before {
+		t.Error("the fr variant was served from cache after the POST; refetching en cleared the invalidation for a Cache without StaleAt")
+	}
+}

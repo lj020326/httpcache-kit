@@ -578,10 +578,18 @@ func (c *cache) removeEntry(entry *cacheEntry) error {
 	delete(c.lruIndex, entry.hashedKey)
 	c.totalSize -= entry.size
 
-	// Remove from stale map
-	c.staleMutex.Lock()
-	delete(c.stale, entry.key)
-	c.staleMutex.Unlock()
+	// The invalidation marker is deliberately NOT removed with the entry.
+	//
+	// It governs more than this entry: a base key's marker is what every Vary
+	// VARIANT of that resource is judged against, and variants are tracked and
+	// evicted independently. Dropping it when LRU eviction happened to take
+	// the base entry left the surviving pre-mutation variants with nothing
+	// marking them stale, so a refetch could publish a new base and a
+	// concurrent lookup reach an old variant through it as a fresh HIT.
+	//
+	// cleanupStaleMap frees markers by AGE instead -- see staleRetention --
+	// which is the only bound that knows how long an entry it governs can
+	// still be around.
 
 	return nil
 }

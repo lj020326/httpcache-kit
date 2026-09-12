@@ -73,6 +73,12 @@ type Handler struct {
 	closing     bool
 	flightsMu   sync.Mutex
 	flights     map[string]*missFlight
+
+	// localStaleMu guards localStale.
+	localStaleMu sync.Mutex
+	// localStale records invalidation times for a Cache that cannot report
+	// them itself. Unused when the cache implements staleAtChecker.
+	localStale map[string]time.Time
 }
 
 type missFlight struct {
@@ -653,7 +659,50 @@ func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
 	// representation was still considered fresh, so an immediate or concurrent
 	// GET could be served stale content after a successful mutation.
 	h.cache.Invalidate(keys...)
+	h.recordStale(keys...)
 	h.debugf("invalidated %d key(s) after %s %s: %q", len(keys), r.Method, r.URL, keys)
+}
+
+// recordStale notes when keys were invalidated, for a Cache that cannot.
+//
+// A cache implementing staleAtChecker keeps this itself, so nothing is
+// recorded for one; only a third-party Cache reaches this map.
+func (h *Handler) recordStale(keys ...string) {
+	if _, ok := h.cache.(staleAtChecker); ok {
+		return
+	}
+
+	now := Clock()
+	cutoff := now.Add(-localStaleRetention)
+
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+
+	if h.localStale == nil {
+		h.localStale = make(map[string]time.Time)
+	}
+	// Swept opportunistically here rather than on a timer: the map only grows
+	// when unsafe requests arrive, so that is also when it is worth pruning.
+	for key, at := range h.localStale {
+		if at.Before(cutoff) {
+			delete(h.localStale, key)
+		}
+	}
+	for _, key := range keys {
+		h.localStale[key] = now
+	}
+}
+
+// staleAt reports when key was invalidated, from whichever record exists.
+func (h *Handler) staleAt(key string) (time.Time, bool) {
+	if checker, ok := h.cache.(staleAtChecker); ok {
+		return checker.StaleAt(key)
+	}
+
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	at, ok := h.localStale[key]
+	return at, ok
 }
 
 // invalidationKeys returns the cache keys made stale by a successful unsafe
@@ -722,6 +771,15 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 	}()
 }
 
+// localStaleRetention is how long the handler keeps its own invalidation
+// markers for a Cache that cannot report them.
+//
+// It has to outlast any entry those markers judge, and the handler cannot ask
+// a third-party Cache how long it keeps things, so this is the built-in
+// cache's own default item TTL. A Cache retaining entries for longer should
+// implement staleAtChecker, which is bounded by its real TTL.
+const localStaleRetention = DefaultCacheTTL
+
 // staleAtChecker is an optional Cache capability: when a key was invalidated.
 //
 // The built-in cache implements it. A third-party Cache that does not simply
@@ -787,13 +845,19 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 		// comparing each variant's own Date against the marker keeps it stale
 		// until it is itself replaced.
 		if varied != nil {
-			if checker, ok := h.cache.(staleAtChecker); ok {
-				if staleAt, marked := checker.StaleAt(baseKey); marked && !varied.DateAfter(staleAt) {
+			// Each variant is judged against the BASE key's marker by its own
+			// receive time. A boolean would not do: refetching one variant
+			// rewrites the base entry, so every OTHER variant would go back to
+			// being a fresh HIT as soon as the first was replaced.
+			//
+			// h.staleAt reads the cache's own record when it keeps one, and
+			// the handler's otherwise -- the previous fallback to the base
+			// ENTRY's state reopened exactly that bug for third-party caches.
+			if staleAt, marked := h.staleAt(baseKey); marked {
+				if !varied.ReceivedAfter(staleAt) {
 					varied.MarkStale()
 				}
 			} else if baseStale {
-				// A Cache that cannot report invalidation times falls back to
-				// the base entry's own state.
 				varied.MarkStale()
 			}
 		}
@@ -844,7 +908,9 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	// RawPath and the decoded "/objects/a/b" in Path, so dropping it produced
 	// an invalidation key for a different resource than the one a direct
 	// request is cached under.
-	ref := r.URL.ResolveReference(&url.URL{Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery})
+	ref := r.URL.ResolveReference(&url.URL{
+		Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery, ForceQuery: u.ForceQuery,
+	})
 	target := *r.URL
 	// The scheme is part of the cache key, so an absolute target naming one
 	// must keep it. Cloning r.URL wholesale turned "Location:
@@ -857,6 +923,11 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	target.Path = ref.Path
 	target.RawPath = ref.RawPath
 	target.RawQuery = ref.RawQuery
+	// ForceQuery too, or "/item?" and "/item" produce the same key while
+	// NewRequestKey keeps them apart -- and, because target starts as a clone
+	// of the mutation's URL, an inherited ForceQuery would otherwise add a "?"
+	// to a target that never had one.
+	target.ForceQuery = ref.ForceQuery
 	target.Fragment = ""
 	return &target
 }
