@@ -20,6 +20,44 @@ type blockingHeaderOpenVFS struct {
 	release     chan struct{}
 }
 
+type blockingInvalidateCache struct {
+	Cache
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingInvalidateCache) Invalidate(keys ...string) {
+	close(c.entered)
+	<-c.release
+	c.Cache.Invalidate(keys...)
+}
+
+type commitObservingWriter struct {
+	header    http.Header
+	committed chan int
+}
+
+func newCommitObservingWriter() *commitObservingWriter {
+	return &commitObservingWriter{
+		header:    make(http.Header),
+		committed: make(chan int, 1),
+	}
+}
+
+func (w *commitObservingWriter) Header() http.Header { return w.header }
+
+func (w *commitObservingWriter) WriteHeader(status int) {
+	w.committed <- status
+}
+
+func (w *commitObservingWriter) Write(body []byte) (int, error) {
+	select {
+	case w.committed <- http.StatusOK:
+	default:
+	}
+	return len(body), nil
+}
+
 func (v *blockingHeaderOpenVFS) OpenFile(path string, flag int, perm os.FileMode) (vfs.WFile, error) {
 	f, err := v.VFS.OpenFile(path, flag, perm)
 	if err != nil {
@@ -222,6 +260,63 @@ func TestUnsafeRequestInvalidatesBeforeBodyCompletes(t *testing.T) {
 	case <-mutationDone:
 	case <-time.After(time.Second):
 		t.Fatal("mutation did not finish after its body was released")
+	}
+}
+
+// TestUnsafeStatusWaitsForInvalidation covers publishing a successful
+// mutation status before its invalidation. A client that observes that status
+// is entitled to issue a dependent GET immediately, so both the status and
+// headers must stay buffered until the old representation is marked stale.
+func TestUnsafeStatusWaitsForInvalidation(t *testing.T) {
+	inner := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	defer func() { _ = inner.Close() }()
+	cache := &blockingInvalidateCache{
+		Cache:   inner,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Mutation", "complete")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	h := NewHandler(cache, upstream)
+	w := newCommitObservingWriter()
+	done := make(chan struct{})
+	go func() {
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "http://example.org/thing", nil))
+		close(done)
+	}()
+
+	select {
+	case <-cache.entered:
+	case <-time.After(time.Second):
+		t.Fatal("mutation did not begin invalidation")
+	}
+	select {
+	case status := <-w.committed:
+		t.Fatalf("status %d was committed before invalidation completed", status)
+	default:
+	}
+	if got := w.Header().Get("X-Mutation"); got != "" {
+		t.Fatalf("header %q was visible before invalidation completed", got)
+	}
+
+	close(cache.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mutation did not finish after invalidation was released")
+	}
+	select {
+	case status := <-w.committed:
+		if status != http.StatusNoContent {
+			t.Fatalf("committed status = %d, want %d", status, http.StatusNoContent)
+		}
+	default:
+		t.Fatal("mutation status was not committed after invalidation")
+	}
+	if got := w.Header().Get("X-Mutation"); got != "complete" {
+		t.Fatalf("committed mutation header = %q, want complete", got)
 	}
 }
 

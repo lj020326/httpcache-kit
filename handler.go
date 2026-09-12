@@ -399,6 +399,7 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 		h.upstream.ServeHTTP(w, r.Request)
 		return
 	}
+	rw.deferHeaders = r.isStateChanging()
 	rdr, err := rw.NextReader()
 	if err != nil {
 		h.debugf("error creating next stream reader: %v", err)
@@ -417,14 +418,15 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 
 	if r.isStateChanging() {
 		// A mutation's status and invalidation headers are complete as soon as
-		// WriteHeader returns. Do not wait for its body: an upstream may stream
-		// that body for a long time after the successful status is already
-		// visible to the client, and concurrent GETs must not see the old
-		// representation throughout that interval.
+		// WriteHeader returns. Invalidate before committing them to the client:
+		// once a successful mutation status is observable, a dependent GET must
+		// no longer be able to use the pre-mutation representation. Do not wait
+		// for the body, which an upstream may stream for a long time.
 		res := NewResourceBytes(rw.StatusCode, nil, rw.responseHeader)
 		if res.IsNonErrorStatus() {
 			h.invalidateResource(res, r)
 		}
+		rw.CommitHeaders()
 		_, _ = io.Copy(io.Discard, rdr)
 		return
 	}
@@ -1325,12 +1327,32 @@ type responseStreamer struct {
 	http.ResponseWriter
 	pipeReader *io.PipeReader
 	pipeWriter *io.PipeWriter
+	// deferHeaders keeps a state-changing response private until its cache
+	// invalidation has completed. Header must therefore return bufferedHeader
+	// rather than exposing the wrapped writer's live header map.
+	deferHeaders   bool
+	bufferedHeader http.Header
 	// responseHeader is the immutable header snapshot that was committed with
-	// StatusCode. It is published by closing C, so WaitHeaders observes both.
+	// StatusCode. It is published by closing C, so WaitHeaders observes both,
+	// even when the actual client commit is deliberately deferred.
 	responseHeader http.Header
 	// C is closed by WriteHeader to signal the headers' writing. headerOnce ensures it is closed at most once.
 	C          chan struct{}
 	headerOnce sync.Once
+	commitOnce sync.Once
+}
+
+// Header implements http.ResponseWriter. Ordinary responses retain the
+// wrapped writer's behavior. State-changing responses use a private copy so
+// neither their status nor headers become observable before invalidation.
+func (rw *responseStreamer) Header() http.Header {
+	if !rw.deferHeaders {
+		return rw.ResponseWriter.Header()
+	}
+	if rw.bufferedHeader == nil {
+		rw.bufferedHeader = rw.ResponseWriter.Header().Clone()
+	}
+	return rw.bufferedHeader
 }
 
 // WaitHeaders returns when WriteHeader has been called (i.e. rw.C is closed).
@@ -1339,14 +1361,34 @@ func (rw *responseStreamer) WaitHeaders() {
 	}
 }
 
-// WriteHeader implements http.ResponseWriter. Safe if called more than once; only the first call closes C and writes the status.
-// C is closed only after status and headers are written so that WaitHeaders() callers observe consistent state (no data race).
+// WriteHeader implements http.ResponseWriter. Safe if called more than once;
+// only the first call publishes the status and immutable header snapshot.
 func (rw *responseStreamer) WriteHeader(status int) {
 	rw.headerOnce.Do(func() {
 		rw.StatusCode = status
-		rw.responseHeader = rw.ResponseWriter.Header().Clone()
-		rw.ResponseWriter.WriteHeader(status)
+		rw.responseHeader = rw.Header().Clone()
+		if !rw.deferHeaders {
+			rw.CommitHeaders()
+		}
 		close(rw.C)
+	})
+}
+
+// CommitHeaders makes the first status and its header snapshot observable to
+// the client. For a state-changing request pipeUpstream calls this only after
+// successful-response invalidation is complete.
+func (rw *responseStreamer) CommitHeaders() {
+	rw.commitOnce.Do(func() {
+		if rw.deferHeaders {
+			dst := rw.ResponseWriter.Header()
+			for name := range dst {
+				delete(dst, name)
+			}
+			for name, values := range rw.responseHeader {
+				dst[name] = append([]string(nil), values...)
+			}
+		}
+		rw.ResponseWriter.WriteHeader(rw.StatusCode)
 	})
 }
 
