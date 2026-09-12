@@ -328,13 +328,18 @@ func (h *Handler) freshness(res *Resource, r *cacheRequest) (time.Duration, erro
 }
 
 func (h *Handler) needsValidation(res *Resource, r *cacheRequest) bool {
-	if res.MustValidate(h.Shared) {
-		return true
-	}
-
 	freshness, err := h.freshness(res, r)
 	if err != nil {
 		h.debugf("error calculating freshness: %s", err.Error())
+		return true
+	}
+
+	// must-revalidate, proxy-revalidate, and s-maxage constrain reuse only
+	// after the stored response has become stale. A still-fresh response is
+	// reusable without a conditional request even when it has no validator.
+	// Once stale, these directives also prohibit satisfying the request via
+	// max-stale, so check them before that exception below.
+	if freshness <= 0 && res.MustValidate(h.Shared) {
 		return true
 	}
 

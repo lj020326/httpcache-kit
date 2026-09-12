@@ -316,23 +316,27 @@ func (c *cache) scanDirectory(dir string, callback func(hashedKey string, info o
 	return nil
 }
 
-func (c *cache) vfsWrite(path string, r io.Reader) (int64, error) {
+// vfsWrite reports whether OpenFile succeeded and may therefore have
+// truncated or partially replaced the target. Callers updating an existing
+// cache entry use that bit to discard stale metadata after delayed copy/close
+// failures without deleting a still-intact entry after a pre-open failure.
+func (c *cache) vfsWrite(path string, r io.Reader) (int64, bool, error) {
 	if err := vfs.MkdirAll(c.fs, pathutil.Dir(path), 0700); err != nil {
-		return 0, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
+		return 0, false, fmt.Errorf("failed to create cache directory for %q: %w", path, err)
 	}
 	f, err := c.fs.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open cache file %q: %w", path, err)
+		return 0, false, fmt.Errorf("failed to open cache file %q: %w", path, err)
 	}
 	n, err := io.Copy(f, r)
 	if err != nil {
 		_ = f.Close()
-		return 0, fmt.Errorf("failed to write cache file %q: %w", path, err)
+		return n, true, fmt.Errorf("failed to write cache file %q: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
-		return 0, fmt.Errorf("failed to close cache file %q: %w", path, err)
+		return n, true, fmt.Errorf("failed to close cache file %q: %w", path, err)
 	}
-	return n, nil
+	return n, true, nil
 }
 
 // atomicWriteFile writes a complete sibling temporary file before replacing
@@ -469,29 +473,34 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 		if hasExpectedSize {
 			body = io.LimitReader(res, expectedSize)
 		}
-		written, err := c.storeBody(body, key)
+		written, bodyModified, err := c.storeBody(body, key)
 		if err != nil {
+			if bodyModified {
+				if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
+					err = errors.Join(err, fmt.Errorf("discard entry after failed body write for key %q: %w", key, discardErr))
+				}
+			}
 			return err
 		}
 		if hasExpectedSize && written != expectedSize {
 			err := fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
-			if discardErr := c.discardUnadmitted(hashedKey); discardErr != nil {
+			if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
 				err = errors.Join(err, fmt.Errorf("discard incomplete entry for key %q: %w", key, discardErr))
 			}
 			return err
 		}
 		if !hasExpectedSize {
 			if err := c.evictIfNeeded(hashedKey, written+int64(len(headerData))); err != nil {
-				if discardErr := c.discardUnadmitted(hashedKey); discardErr != nil {
+				if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
 					err = errors.Join(err, fmt.Errorf("discard unadmitted entry for key %q: %w", key, discardErr))
 				}
 				return fmt.Errorf("failed to make room for key %q: %w", key, err)
 			}
 		}
 
-		headerBytes, err := c.storeSerializedHeader(headerData, key)
+		headerBytes, _, err := c.storeSerializedHeader(headerData, key)
 		if err != nil {
-			if discardErr := c.discardUnadmitted(hashedKey); discardErr != nil {
+			if discardErr := c.discardUnadmitted(key, hashedKey, written+int64(len(headerData)), storedAt); discardErr != nil {
 				err = errors.Join(err, fmt.Errorf("discard entry with incomplete header for key %q: %w", key, discardErr))
 			}
 			return err
@@ -504,18 +513,18 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 	return nil
 }
 
-func (c *cache) storeBody(r io.Reader, key string) (int64, error) {
-	n, err := c.vfsWrite(bodyPrefix+formatPrefix+hashKey(key), r)
+func (c *cache) storeBody(r io.Reader, key string) (int64, bool, error) {
+	n, modified, err := c.vfsWrite(bodyPrefix+formatPrefix+hashKey(key), r)
 	if err != nil {
-		return 0, fmt.Errorf("failed to store body for key %q: %w", key, err)
+		return n, modified, fmt.Errorf("failed to store body for key %q: %w", key, err)
 	}
-	return n, nil
+	return n, modified, nil
 }
 
-func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.Time) (int64, error) {
+func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.Time) (int64, bool, error) {
 	headerData, err := serializeStoredHeader(code, h, storedAt)
 	if err != nil {
-		return 0, fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
+		return 0, false, fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
 	}
 	return c.storeSerializedHeader(headerData, key)
 }
@@ -530,12 +539,12 @@ func serializeStoredHeader(code int, h http.Header, storedAt time.Time) ([]byte,
 	return hb.Bytes(), nil
 }
 
-func (c *cache) storeSerializedHeader(headerData []byte, key string) (int64, error) {
-	n, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
+func (c *cache) storeSerializedHeader(headerData []byte, key string) (int64, bool, error) {
+	n, modified, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
 	if err != nil {
-		return 0, fmt.Errorf("failed to store header for key %q: %w", key, err)
+		return n, modified, fmt.Errorf("failed to store header for key %q: %w", key, err)
 	}
-	return n, nil
+	return n, modified, nil
 }
 
 // Retrieve returns a cached Resource for the given key
@@ -694,7 +703,7 @@ func (c *cache) persistStale(snapshot map[string]time.Time) {
 	if c.diskRoot != "" {
 		_, writeErr = atomicWriteFile(filepath.Join(c.diskRoot, filepath.FromSlash(staleMapPath)), bytes.NewReader(encoded))
 	} else {
-		_, writeErr = c.vfsWrite(staleMapSlotPath(nextGeneration), bytes.NewReader(encoded))
+		_, _, writeErr = c.vfsWrite(staleMapSlotPath(nextGeneration), bytes.NewReader(encoded))
 	}
 	if writeErr != nil {
 		debugf("failed to persist invalidation markers: %v", writeErr)
@@ -827,7 +836,12 @@ func (c *cache) Freshen(res *Resource, keys ...string) error {
 				if h.StatusCode == res.Status() && headersEqual(h.Header, res.Header()) {
 					debugf("freshening key %s", key)
 					freshenedAt := Clock()
-					if _, writeErr := c.storeHeader(h.StatusCode, res.Header(), key, freshenedAt); writeErr != nil {
+					if _, headerModified, writeErr := c.storeHeader(h.StatusCode, res.Header(), key, freshenedAt); writeErr != nil {
+						if headerModified {
+							if discardErr := c.discardUnadmitted(key, hashKey(key), 0, freshenedAt); discardErr != nil {
+								writeErr = errors.Join(writeErr, fmt.Errorf("discard entry after failed header write for key %q: %w", key, discardErr))
+							}
+						}
 						return fmt.Errorf("failed to freshen header for key %q: %w", key, writeErr)
 					}
 					// The entry has just been validated against the origin, so
@@ -993,14 +1007,20 @@ func (c *cache) touchEntry(hashedKey string) {
 
 // discardUnadmitted removes every on-disk part and any old LRU record for a
 // key whose body was already overwritten but whose replacement could not be
-// committed. Leaving the previous header and metadata behind would make a
-// failed Store look like a counted cache entry even though its body is gone.
-func (c *cache) discardUnadmitted(hashedKey string) error {
+// committed. If the backing store refuses removal, the residual is retained
+// in the LRU/size ledger so cleanup retries it and repeated rejected writes
+// cannot grow the backing store invisibly.
+func (c *cache) discardUnadmitted(key, hashedKey string, residualSize int64, storedAt time.Time) error {
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
 	if entry, exists := c.lruIndex[hashedKey]; exists {
-		return c.removeEntry(entry)
+		removeErr := c.removeEntry(entry)
+		if removeErr != nil && residualSize > entry.size {
+			c.totalSize += residualSize - entry.size
+			entry.size = residualSize
+		}
+		return removeErr
 	}
 
 	var removeErr error
@@ -1011,6 +1031,24 @@ func (c *cache) discardUnadmitted(hashedKey string) error {
 		if err := c.fs.Remove(path); err != nil && !vfs.IsNotExist(err) {
 			removeErr = errors.Join(removeErr, fmt.Errorf("remove cache file %s: %w", path, err))
 		}
+	}
+	if removeErr != nil {
+		if residualSize <= 0 {
+			residualSize = 1
+		}
+		if storedAt.IsZero() {
+			storedAt = Clock()
+		}
+		entry := &cacheEntry{
+			key:        key,
+			hashedKey:  hashedKey,
+			size:       residualSize,
+			storedAt:   storedAt,
+			accessedAt: storedAt,
+		}
+		entry.element = c.lruList.PushFront(entry)
+		c.lruIndex[hashedKey] = entry
+		c.totalSize += residualSize
 	}
 	return removeErr
 }

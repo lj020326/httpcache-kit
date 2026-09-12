@@ -523,6 +523,11 @@ func TestOnlyIfCached_InCacheNeedsValidation(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	Writes.Wait()
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatalf("newCacheRequest: %v", err)
+	}
+	cache.Invalidate(cReq.Key.String())
 	req2 := httptest.NewRequest("GET", "http://example.org/", nil)
 	req2.Header.Set("Cache-Control", "only-if-cached")
 	rec2 := httptest.NewRecorder()

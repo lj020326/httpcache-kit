@@ -407,6 +407,33 @@ func TestRejectedUnknownLengthReplacementDiscardsOldMetadata(t *testing.T) {
 	}
 }
 
+func TestRejectedNewEntryTracksResidualWhenRemovalFails(t *testing.T) {
+	fs := &selectiveRemoveFailVFS{VFS: vfs.Memory(), failHash: hashKey("residual")}
+	config := DefaultCacheConfig().WithMaxSize(64).WithCleanupInterval(0)
+	c := NewVFSCacheWithConfig(fs, config).(*cache)
+	defer func() { _ = c.Close() }()
+
+	// No Content-Length means admission happens after the body write. The item
+	// is too large, and the injected Remove failure leaves a real residual that
+	// must remain visible to both Stats and later cleanup attempts.
+	res := NewResourceBytes(http.StatusOK, []byte(strings.Repeat("x", 128)), http.Header{})
+	if err := c.Store(res, "residual"); err == nil {
+		t.Fatal("oversized unknown-length entry was admitted")
+	}
+	if stats := c.Stats(); stats.ItemCount != 1 || stats.TotalSize <= config.MaxSize {
+		t.Fatalf("unremovable residual was not tracked: %+v", stats)
+	}
+
+	fs.failHash = ""
+	result := c.Cleanup()
+	if result.RemovedItems != 1 {
+		t.Fatalf("cleanup removed %d items, want tracked residual", result.RemovedItems)
+	}
+	if stats := c.Stats(); stats.ItemCount != 0 || stats.TotalSize != 0 {
+		t.Fatalf("stats after residual retry = %+v", stats)
+	}
+}
+
 func TestStore_NoContentLength(t *testing.T) {
 	// Store with no Content-Length uses io.Copy path
 	cache := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
@@ -838,6 +865,36 @@ func (w *writeFailWFile) Write(p []byte) (n int, err error) {
 	return 0, os.ErrPermission
 }
 
+type closeFailWFile struct {
+	vfs.WFile
+}
+
+func (w *closeFailWFile) Close() error {
+	return errors.Join(w.WFile.Close(), errors.New("injected delayed close failure"))
+}
+
+type bodyCloseFailVFS struct {
+	vfs.VFS
+	failNextBodyClose   bool
+	failNextHeaderClose bool
+}
+
+func (v *bodyCloseFailVFS) OpenFile(path string, flag int, perm os.FileMode) (vfs.WFile, error) {
+	f, err := v.VFS.OpenFile(path, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	if v.failNextBodyClose && strings.HasPrefix(path, "body/") {
+		v.failNextBodyClose = false
+		return &closeFailWFile{WFile: f}, nil
+	}
+	if v.failNextHeaderClose && strings.HasPrefix(path, "header/") {
+		v.failNextHeaderClose = false
+		return &closeFailWFile{WFile: f}, nil
+	}
+	return f, nil
+}
+
 type partialMarkerWFile struct {
 	vfs.WFile
 	wrote bool
@@ -898,6 +955,33 @@ func TestStore_VfsWriteCopyFails(t *testing.T) {
 	err := c.Store(res, "k")
 	if err == nil {
 		t.Error("expected error when io.Copy fails in vfsWrite")
+	}
+}
+
+func TestStore_BodyCloseFailureDiscardsReplacement(t *testing.T) {
+	fs := &bodyCloseFailVFS{VFS: vfs.Memory()}
+	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
+	defer func() { _ = c.Close() }()
+	const key = "delayed-close-replacement"
+
+	old := NewResourceBytes(http.StatusOK, []byte("old"), http.Header{"Content-Length": {"3"}})
+	if err := c.Store(old, key); err != nil {
+		t.Fatalf("Store(old): %v", err)
+	}
+	fs.failNextBodyClose = true
+	replacement := NewResourceBytes(http.StatusOK, []byte("new"), http.Header{"Content-Length": {"3"}})
+	if err := c.Store(replacement, key); err == nil {
+		t.Fatal("Store(replacement) succeeded despite the injected body close failure")
+	}
+
+	if stats := c.Stats(); stats.ItemCount != 0 || stats.TotalSize != 0 {
+		t.Fatalf("failed replacement left stale metadata: %+v", stats)
+	}
+	if _, err := c.Retrieve(key); err != ErrNotFoundInCache {
+		t.Fatalf("replacement key error = %v, want ErrNotFoundInCache", err)
+	}
+	if _, err := c.Header(key); err != ErrNotFoundInCache {
+		t.Fatalf("replacement header error = %v, want ErrNotFoundInCache", err)
 	}
 }
 
@@ -1169,6 +1253,31 @@ func TestFreshen_StoreHeaderFails(t *testing.T) {
 	err := c.Freshen(res2, "k")
 	if err == nil {
 		t.Error("expected error when storeHeader fails during Freshen")
+	}
+}
+
+func TestFreshen_HeaderCloseFailureDiscardsEntry(t *testing.T) {
+	fs := &bodyCloseFailVFS{VFS: vfs.Memory()}
+	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
+	defer func() { _ = c.Close() }()
+	const key = "freshen-close-failure"
+	headers := http.Header{
+		"Content-Length": {"1"},
+		"Cache-Control":  {"max-age=60"},
+	}
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("x"), headers), key); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	fs.failNextHeaderClose = true
+	if err := c.Freshen(NewResourceBytes(http.StatusOK, []byte("x"), headers), key); err == nil {
+		t.Fatal("Freshen succeeded despite the injected header close failure")
+	}
+	if stats := c.Stats(); stats.ItemCount != 0 || stats.TotalSize != 0 {
+		t.Fatalf("failed Freshen left stale metadata: %+v", stats)
+	}
+	if _, err := c.Retrieve(key); err != ErrNotFoundInCache {
+		t.Fatalf("freshened key error = %v, want ErrNotFoundInCache", err)
 	}
 }
 
