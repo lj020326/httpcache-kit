@@ -430,6 +430,7 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 		return nil, fmt.Errorf("failed to retrieve header for key %q: %w", key, err)
 	}
 	res := NewResource(h.StatusCode, f, h.Header)
+	res.SetStoredAt(c.entryStoredAt(hashedKey))
 
 	// Check stale map with proper locking
 	c.staleMutex.RLock()
@@ -437,7 +438,7 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 	c.staleMutex.RUnlock()
 
 	if exists {
-		if !res.ReceivedAfter(staleTime) {
+		if !res.StoredAfter(staleTime) {
 			debugf("stale marker of %s found", staleTime)
 			res.MarkStale()
 		}
@@ -549,6 +550,10 @@ func (c *cache) Freshen(res *Resource, keys ...string) error {
 				if _, err := c.storeHeader(h.StatusCode, res.Header(), key); err != nil {
 					return fmt.Errorf("failed to freshen header for key %q: %w", key, err)
 				}
+				// The entry has just been validated against the origin, so
+				// its store time is now. Without this the LRU still held the
+				// PRE-invalidation time and the entry stayed stale.
+				c.markFreshened(hashKey(key))
 			} else {
 				debugf("freshen failed, invalidating %s", key)
 				c.Invalidate(key)
@@ -633,6 +638,35 @@ func (c *cache) trackEntry(key, hashedKey string, size int64) {
 		entry.element = c.lruList.PushFront(entry)
 		c.lruIndex[hashedKey] = entry
 		c.totalSize += size
+	}
+}
+
+// entryStoredAt reports when this cache last WROTE the entry, at full
+// precision. Zero when the entry is not tracked.
+func (c *cache) entryStoredAt(hashedKey string) time.Time {
+	c.lruMutex.Lock()
+	defer c.lruMutex.Unlock()
+
+	if entry, exists := c.lruIndex[hashedKey]; exists {
+		return entry.storedAt
+	}
+	return time.Time{}
+}
+
+// markFreshened records that the entry was just validated against the origin.
+//
+// Only the timestamps: the size is unchanged by a freshen, and writing the
+// header's length over it would corrupt the total the size cap is enforced
+// against.
+func (c *cache) markFreshened(hashedKey string) {
+	c.lruMutex.Lock()
+	defer c.lruMutex.Unlock()
+
+	if entry, exists := c.lruIndex[hashedKey]; exists {
+		now := Clock()
+		entry.storedAt = now
+		entry.accessedAt = now
+		c.lruList.MoveToFront(entry.element)
 	}
 }
 

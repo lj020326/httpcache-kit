@@ -890,7 +890,11 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 			// the handler's otherwise -- the previous fallback to the base
 			// ENTRY's state reopened exactly that bug for third-party caches.
 			if staleAt, marked := h.staleAt(baseKey); marked {
-				if !varied.ReceivedAfter(staleAt) {
+				// StoredAfter, not ReceivedAfter: HTTP dates are
+				// second-granular and the marker is not, so a variant
+				// revalidated in the same second as the mutation could never
+				// clear it and was revalidated upstream on every request.
+				if !varied.StoredAfter(staleAt) {
 					varied.MarkStale()
 				}
 			} else if baseStale {

@@ -684,3 +684,67 @@ func TestInvalidationSurvivesARestart(t *testing.T) {
 		t.Error("the pre-mutation entry came back fresh after a restart")
 	}
 }
+
+// --- Codex review round 6 (PR #5) ---
+
+// TestRevalidatedVariantStopsRevalidating covers freshening the VARIANT that
+// lookup actually retrieved, not just the base key.
+//
+// An invalidated Vary variant carrying an ETag is revalidated upstream, and
+// the conditional request comes back unchanged. Freshening only the base key
+// left the variant's stored Proxy-Date older than the base marker -- and each
+// variant is judged against that marker by its own receive time -- so it was
+// marked stale again on the very next request and revalidated upstream every
+// time until the marker was swept.
+func TestRevalidatedVariantStopsRevalidating(t *testing.T) {
+	var upstreamHits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", "Accept-Language")
+		w.Header().Set("ETag", `"v1"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	})
+
+	h := NewHandler(NewMemoryCache(), upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	get := func(lang string) {
+		req := httptest.NewRequest("GET", "http://example.org/thing", nil)
+		req.Header.Set("Accept-Language", lang)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		rec.Flush()
+	}
+
+	get("en")
+	h.writes.Wait()
+	get("fr")
+	h.writes.Wait()
+
+	// A mutation invalidates the base key, and with it every variant.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "http://example.org/thing", nil))
+	rec.Flush()
+
+	// The first request after it revalidates: the ETag is unchanged, so the
+	// stored entry is kept and freshened.
+	before := atomic.LoadInt32(&upstreamHits)
+	get("en")
+	h.writes.Wait()
+	if atomic.LoadInt32(&upstreamHits) == before {
+		t.Fatal("the invalidated variant was served without revalidating")
+	}
+
+	// Every request after THAT must be a plain hit. The variant has been
+	// validated against the origin once; asking again on each request makes
+	// the invalidation permanent for the marker's whole lifetime.
+	before = atomic.LoadInt32(&upstreamHits)
+	get("en")
+	get("en")
+	h.writes.Wait()
+	if got := atomic.LoadInt32(&upstreamHits) - before; got != 0 {
+		t.Errorf("%d further upstream request(s) after a successful revalidation, want 0", got)
+	}
+}
