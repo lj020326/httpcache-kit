@@ -449,6 +449,41 @@ func TestCleanupRemovesExpiredEntryBeforeMarker(t *testing.T) {
 	}
 }
 
+// TestCleanupRetainsMarkerWhenEntryRemovalFails covers the crash-safe failure
+// path: an undeleted file must keep both its LRU record (for retry) and its
+// stale marker (so restart cannot republish it as fresh).
+func TestCleanupRetainsMarkerWhenEntryRemovalFails(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	config := DefaultCacheConfig().
+		WithTTL(time.Hour).
+		WithStaleMapTTL(time.Hour).
+		WithCleanupInterval(0)
+	c := NewVFSCacheWithConfig(&removeFailVFS{vfs.Memory()}, config).(*cache)
+	defer func() { _ = c.Close() }()
+	const key = "failed-cleanup"
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("old"), http.Header{}), key); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	c.Invalidate(key)
+	now = now.Add(2 * time.Hour)
+
+	result := c.Cleanup()
+	if result.RemovedItems != 0 || result.RemovedStaleEntries != 0 {
+		t.Errorf("cleanup result = %+v, want failed item and marker retained", result)
+	}
+	if stats := c.Stats(); stats.ItemCount != 1 || stats.StaleCount != 1 {
+		t.Errorf("stats after failed removal = %+v, want one retryable item and marker", stats)
+	}
+	if _, ok := c.StaleAt(key); !ok {
+		t.Error("marker was removed even though its backing entry could not be deleted")
+	}
+}
+
 // TestCloseWaitsForCleanupLoop makes Close's join guarantee observable: the
 // periodic loop is held inside a filesystem removal and Close must not return
 // until that cleanup exits.

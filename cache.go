@@ -967,11 +967,20 @@ func (c *cache) removeEntry(entry *cacheEntry) error {
 	bodyPath := bodyPrefix + formatPrefix + entry.hashedKey
 	headerPath := headerPrefix + formatPrefix + entry.hashedKey
 
+	var removeErr error
 	if err := c.fs.Remove(bodyPath); err != nil && !vfs.IsNotExist(err) {
 		debugf("failed to remove body file %s: %v", bodyPath, err)
+		removeErr = errors.Join(removeErr, fmt.Errorf("remove body file %s: %w", bodyPath, err))
 	}
 	if err := c.fs.Remove(headerPath); err != nil && !vfs.IsNotExist(err) {
 		debugf("failed to remove header file %s: %v", headerPath, err)
+		removeErr = errors.Join(removeErr, fmt.Errorf("remove header file %s: %w", headerPath, err))
+	}
+	if removeErr != nil {
+		// Keep the LRU record so a later cleanup retries the residual files.
+		// Dropping the record now would let marker cleanup assume the backing
+		// entry is gone and republish it as fresh after a restart.
+		return removeErr
 	}
 
 	// Remove from LRU tracking (assumes lruMutex is already held)
@@ -1018,7 +1027,11 @@ func (c *cache) evictIfNeeded(additionalSize int64) {
 		entry := elem.Value.(*cacheEntry)
 		debugf("evicting LRU entry: %s (size: %d, accessed: %s)",
 			entry.key, entry.size, entry.accessedAt.Format(time.RFC3339))
-		_ = c.removeEntry(entry)
+		if err := c.removeEntry(entry); err != nil {
+			// The oldest entry could not be removed, so this call cannot safely
+			// make additional room without potentially spinning on failures.
+			break
+		}
 
 		// Record eviction metric
 		if getDefaultMetrics() != nil {
@@ -1061,11 +1074,15 @@ func (c *cache) Cleanup() CleanupResult {
 	// boundary entry cannot fall between them as cleanup runs.
 	c.cleanupMu.Lock()
 	if c.config.TTL > 0 {
-		removed, bytes := c.cleanupTTLExpired(start)
+		removed, bytes, complete := c.cleanupTTLExpired(start)
 		result.RemovedItems += removed
 		result.RemovedBytes += bytes
+		if complete {
+			result.RemovedStaleEntries = c.cleanupStaleMap(start)
+		}
+	} else {
+		result.RemovedStaleEntries = c.cleanupStaleMap(start)
 	}
-	result.RemovedStaleEntries = c.cleanupStaleMap(start)
 	c.cleanupMu.Unlock()
 
 	// Enforce size limit
@@ -1146,13 +1163,14 @@ func (c *cache) cleanupStaleMap(now time.Time) int {
 }
 
 // cleanupTTLExpired removes items that have exceeded their TTL
-func (c *cache) cleanupTTLExpired(now time.Time) (int, int64) {
+func (c *cache) cleanupTTLExpired(now time.Time) (int, int64, bool) {
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
 	cutoff := now.Add(-c.config.TTL)
 	removed := 0
 	var bytesRemoved int64
+	complete := true
 
 	// Iterate from back (oldest) to front
 	for elem := c.lruList.Back(); elem != nil; {
@@ -1162,20 +1180,23 @@ func (c *cache) cleanupTTLExpired(now time.Time) (int, int64) {
 		if entry.storedAt.Before(cutoff) {
 			debugf("removing TTL-expired entry: %s (stored: %s)",
 				entry.key, entry.storedAt.Format(time.RFC3339))
-			bytesRemoved += entry.size
-			_ = c.removeEntry(entry)
-			removed++
+			if err := c.removeEntry(entry); err != nil {
+				complete = false
+			} else {
+				bytesRemoved += entry.size
+				removed++
 
-			// Record eviction metric
-			if getDefaultMetrics() != nil {
-				getDefaultMetrics().RecordCacheEviction("ttl")
+				// Record eviction metric
+				if getDefaultMetrics() != nil {
+					getDefaultMetrics().RecordCacheEviction("ttl")
+				}
 			}
 		}
 
 		elem = prev
 	}
 
-	return removed, bytesRemoved
+	return removed, bytesRemoved, complete
 }
 
 // enforceMaxSize ensures cache doesn't exceed max size
@@ -1194,8 +1215,10 @@ func (c *cache) enforceMaxSize() (int, int64) {
 		entry := elem.Value.(*cacheEntry)
 		debugf("enforcing max size, removing: %s (size: %d)",
 			entry.key, entry.size)
+		if err := c.removeEntry(entry); err != nil {
+			break
+		}
 		bytesRemoved += entry.size
-		_ = c.removeEntry(entry)
 		removed++
 
 		// Record eviction metric
@@ -1256,12 +1279,19 @@ func (c *cache) Purge() error {
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
-	// Remove all entries
+	// Remove all entries. If any backing file remains, retain every stale
+	// marker: it is still needed to keep that residual entry stale on restart.
+	var purgeErr error
 	for elem := c.lruList.Front(); elem != nil; {
 		entry := elem.Value.(*cacheEntry)
 		next := elem.Next()
-		_ = c.removeEntry(entry)
+		if err := c.removeEntry(entry); err != nil {
+			purgeErr = errors.Join(purgeErr, err)
+		}
 		elem = next
+	}
+	if purgeErr != nil {
+		return purgeErr
 	}
 
 	// Clear the stale map in the backing store too. Persisting an empty newest
