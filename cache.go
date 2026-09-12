@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"container/list"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -190,6 +191,10 @@ func NewDiskCacheWithConfig(dir string, config *CacheConfig) (ExtendedCache, err
 		if err := c.scanExistingCache(); err != nil {
 			debugf("warning: failed to scan existing cache: %v", err)
 		}
+		// After the scan: those entries are exactly the ones the markers
+		// judge, so restoring the markers without them would be pointless and
+		// restoring them after is what makes the pair consistent.
+		c.loadStale()
 	}
 
 	return extCache, nil
@@ -317,6 +322,20 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 	}
 
 	for _, key := range keys {
+		// A response the marker already supersedes is not stored at all.
+		//
+		// It would be served stale anyway, and storing it is what made marker
+		// retention unsolvable: a GET received BEFORE a mutation whose
+		// background Store lands after it has a Proxy-Date older than the
+		// marker but a storedAt that is newer, so it outlives
+		// markerTime + TTL and became a fresh HIT once cleanup removed the
+		// marker. Skipping it means every stored entry either predates the
+		// marker -- and is evicted before it -- or supersedes it.
+		if staleTime, marked := c.StaleAt(key); marked && !res.ReceivedAfter(staleTime) {
+			debugf("not storing %s: superseded by the invalidation at %s", key, staleTime)
+			continue
+		}
+
 		if _, err := res.Seek(0, io.SeekStart); err != nil {
 			return fmt.Errorf("failed to rewind resource for key %q: %w", key, err)
 		}
@@ -434,11 +453,79 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 func (c *cache) Invalidate(keys ...string) {
 	debugf("invalidating %q", keys)
 	c.staleMutex.Lock()
-	defer c.staleMutex.Unlock()
 	now := Clock()
 	for _, key := range keys {
 		c.stale[key] = now
 	}
+	snapshot := c.snapshotStaleLocked()
+	c.staleMutex.Unlock()
+
+	// Written through to the backing store, so a restart does not lose it.
+	//
+	// The markers are the ONLY record that the entries still on disk predate
+	// a mutation, and scanExistingCache restores those entries. Keeping the
+	// map in memory alone meant every deploy or crash republished the
+	// pre-mutation representation -- Vary variants included -- as a fresh HIT.
+	c.persistStale(snapshot)
+}
+
+// staleMapPath is where the invalidation markers are kept in the backing
+// store. The other entries live under hashed-key prefixes, so this cannot
+// collide with one.
+const staleMapPath = "stale-markers.json"
+
+// snapshotStaleLocked copies the marker map. Callers hold staleMutex.
+func (c *cache) snapshotStaleLocked() map[string]time.Time {
+	out := make(map[string]time.Time, len(c.stale))
+	for k, v := range c.stale {
+		out[k] = v
+	}
+	return out
+}
+
+// persistStale writes the markers to the backing store.
+//
+// Failures are logged, not returned: the in-memory markers are already
+// correct, so the mutation this accompanies has still been honoured for the
+// life of the process. What is lost is only the restart guarantee.
+func (c *cache) persistStale(snapshot map[string]time.Time) {
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		debugf("failed to encode invalidation markers: %v", err)
+		return
+	}
+	if _, err := c.vfsWrite(staleMapPath, bytes.NewReader(encoded)); err != nil {
+		debugf("failed to persist invalidation markers: %v", err)
+	}
+}
+
+// loadStale restores markers written by a previous process.
+func (c *cache) loadStale() {
+	f, err := c.fs.Open(staleMapPath)
+	if err != nil {
+		if !vfs.IsNotExist(err) {
+			debugf("failed to open invalidation markers: %v", err)
+		}
+		return
+	}
+	defer func() { _ = f.Close() }()
+
+	var restored map[string]time.Time
+	if err := json.NewDecoder(f).Decode(&restored); err != nil {
+		debugf("failed to decode invalidation markers: %v", err)
+		return
+	}
+
+	c.staleMutex.Lock()
+	defer c.staleMutex.Unlock()
+	for key, at := range restored {
+		// Never overwrite a marker this process has already written: it is
+		// newer than anything on disk.
+		if _, ok := c.stale[key]; !ok {
+			c.stale[key] = at
+		}
+	}
+	debugf("restored %d invalidation marker(s)", len(restored))
 }
 
 // StaleAt returns when key was invalidated, if it was.
@@ -726,6 +813,13 @@ func (c *cache) cleanupStaleMap() int {
 		}
 	}
 
+	if removed > 0 {
+		// Written through, like Invalidate: otherwise a restart would restore
+		// markers this sweep has just decided are no longer needed.
+		snapshot := c.snapshotStaleLocked()
+		defer c.persistStale(snapshot)
+	}
+
 	return removed
 }
 
@@ -843,10 +937,14 @@ func (c *cache) Purge() error {
 		elem = next
 	}
 
-	// Clear stale map
+	// Clear stale map, in the backing store too: leaving the file behind
+	// would restore markers for entries this call just removed.
 	c.staleMutex.Lock()
 	c.stale = make(map[string]time.Time)
 	c.staleMutex.Unlock()
+	if err := c.fs.Remove(staleMapPath); err != nil && !vfs.IsNotExist(err) {
+		debugf("failed to remove persisted invalidation markers: %v", err)
+	}
 
 	return nil
 }

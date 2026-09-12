@@ -298,7 +298,13 @@ func TestOlderStoreCannotClearANewerInvalidation(t *testing.T) {
 		t.Fatalf("Store error = %v", err)
 	}
 
+	// Not served as fresh, by either route: the store is refused outright
+	// (which is what happens now -- an entry the marker already supersedes is
+	// not worth caching), or it lands and is marked stale.
 	got, err := c.Retrieve(key)
+	if err == ErrNotFoundInCache {
+		return
+	}
 	if err != nil {
 		t.Fatalf("Retrieve error = %v", err)
 	}
@@ -546,5 +552,135 @@ func TestInvalidationSurvivesForACacheWithoutStaleAt(t *testing.T) {
 	get("fr")
 	if atomic.LoadInt32(&upstreamHits) == before {
 		t.Error("the fr variant was served from cache after the POST; refetching en cleared the invalidation for a Cache without StaleAt")
+	}
+}
+
+// --- Codex review round 5 (PR #5) ---
+
+// TestSupersededStoreIsNotCached is the regression test for retaining a
+// response the marker already supersedes.
+//
+// A GET received BEFORE a mutation whose background Store lands after it has a
+// Proxy-Date older than the marker but a storedAt that is newer, so it
+// outlived markerTime + TTL and became a fresh HIT the moment cleanup removed
+// the marker. Not storing it at all makes marker retention tractable: every
+// stored entry either predates the marker and is evicted before it, or
+// supersedes it.
+func TestSupersededStoreIsNotCached(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	defer func() { _ = c.Close() }()
+
+	const key = "GET:http://example.org/thing"
+
+	// Received a minute ago; the mutation happens now.
+	stale := NewResourceBytes(http.StatusOK, []byte("before"), http.Header{
+		ProxyDateHeader: {now.Add(-time.Minute).Format(http.TimeFormat)},
+	})
+	c.Invalidate(key)
+
+	if err := c.Store(stale, key); err != nil {
+		t.Fatalf("Store error = %v", err)
+	}
+	if _, err := c.Retrieve(key); err != ErrNotFoundInCache {
+		t.Errorf("Retrieve = %v, want ErrNotFoundInCache; a superseded response was cached", err)
+	}
+
+	// A replacement received AFTER the mutation is stored normally.
+	now = now.Add(2 * time.Second)
+	fresh := NewResourceBytes(http.StatusOK, []byte("after"), http.Header{
+		ProxyDateHeader: {now.Format(http.TimeFormat)},
+	})
+	if err := c.Store(fresh, key); err != nil {
+		t.Fatalf("Store error = %v", err)
+	}
+	got, err := c.Retrieve(key)
+	if err != nil {
+		t.Fatalf("Retrieve error = %v", err)
+	}
+	defer func() { _ = got.Close() }()
+	if got.IsStale() {
+		t.Error("the replacement was marked stale")
+	}
+}
+
+// TestAbsoluteInvalidationTargetKeepsItsEmptyPath is the regression test for
+// resolving an absolute reference as if it were relative. "Location:
+// http://example.org?q" has an EMPTY path, but rebuilding it as a relative
+// reference made it inherit the mutation's path -- so a mutation at /orders/1
+// invalidated /orders/1?q and left the named representation fresh.
+func TestAbsoluteInvalidationTargetKeepsItsEmptyPath(t *testing.T) {
+	r := httptest.NewRequest("POST", "http://example.org/orders/1", nil)
+	cr, err := newCacheRequest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := cr.sameOriginURL("http://example.org?q")
+	if u == nil {
+		t.Fatal("sameOriginURL returned nil for a same-host absolute target")
+	}
+	if u.Path != "" {
+		t.Errorf("Path = %q, want empty -- the absolute target named no path", u.Path)
+	}
+	if u.RawQuery != "q" {
+		t.Errorf("RawQuery = %q, want q", u.RawQuery)
+	}
+
+	// A genuinely relative query-only reference still inherits the base path.
+	if rel := cr.sameOriginURL("?q"); rel == nil || rel.Path != "/orders/1" {
+		t.Errorf("relative ?q resolved to %v, want the base path /orders/1", rel)
+	}
+}
+
+// TestInvalidationSurvivesARestart is the regression test for keeping the
+// markers in memory only.
+//
+// scanExistingCache restores the cached bodies and headers on startup, but the
+// markers -- the ONLY record that those entries predate a mutation -- were
+// rebuilt empty. Every deploy or crash therefore republished the pre-mutation
+// representation, Vary variants included, as a fresh HIT.
+func TestInvalidationSurvivesARestart(t *testing.T) {
+	dir := t.TempDir()
+	const key = "GET:http://example.org/thing"
+
+	first, err := NewDiskCacheWithConfig(dir, DefaultCacheConfig().WithCleanupInterval(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Store(NewResourceBytes(http.StatusOK, []byte("before"), http.Header{}), key); err != nil {
+		t.Fatal(err)
+	}
+	first.Invalidate(key)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new process opens the same directory.
+	second, err := NewDiskCacheWithConfig(dir, DefaultCacheConfig().WithCleanupInterval(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+
+	inner, ok := second.(*cache)
+	if !ok {
+		t.Fatalf("cache is %T, want *cache", second)
+	}
+	if _, marked := inner.StaleAt(key); !marked {
+		t.Fatal("the invalidation marker was lost across the restart")
+	}
+
+	got, err := second.Retrieve(key)
+	if err != nil {
+		t.Fatalf("Retrieve error = %v; the entry itself should have been restored", err)
+	}
+	defer func() { _ = got.Close() }()
+	if !got.IsStale() {
+		t.Error("the pre-mutation entry came back fresh after a restart")
 	}
 }

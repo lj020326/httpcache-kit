@@ -1157,3 +1157,92 @@ func TestUpstreamWithoutExplicitWriteHeaderDoesNotHang(t *testing.T) {
 		})
 	}
 }
+
+// --- Codex review round 5 (PR #5) ---
+
+// TestLookupRecordsTheServedVariantKey pins the mechanism the validation path
+// relies on. A successful revalidation used to freshen only the BASE key, so
+// the variant that was actually retrieved kept a Proxy-Date older than the
+// base marker and was marked stale again on the very next request --
+// revalidating upstream every time until the marker was swept.
+func TestLookupRecordsTheServedVariantKey(t *testing.T) {
+	var hits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", "Accept-Language")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	})
+
+	h := NewHandler(NewMemoryCache(), upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	req := httptest.NewRequest("GET", "http://example.org/thing", nil)
+	req.Header.Set("Accept-Language", "en")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	rec.Flush()
+	h.writes.Wait()
+
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := h.lookup(cReq)
+	if err != nil {
+		t.Fatalf("lookup error = %v", err)
+	}
+	defer func() { _ = res.Close() }()
+
+	want := cReq.Key.Vary("Accept-Language", req).String()
+	if cReq.servedKey != want {
+		t.Errorf("servedKey = %q, want the variant key %q", cReq.servedKey, want)
+	}
+	if cReq.servedKey == cReq.Key.String() {
+		t.Error("servedKey is the base key; the variant that was served is not recorded")
+	}
+}
+
+// TestStaleMarkerTTLIsConfigurable is the regression test for hard-coding the
+// handler's marker retention to DefaultCacheTTL. A third-party Cache keeping
+// entries longer than seven days lost the invalidation before its own entries
+// expired, so a pre-mutation Vary variant became a HIT again. Only the
+// implementation knows its retention, so it is a knob.
+func TestStaleMarkerTTLIsConfigurable(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	upstream := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+
+	if got := NewHandler(plainCache{inner: NewMemoryCache()}, upstream).staleMarkerTTL(); got != DefaultCacheTTL {
+		t.Errorf("default staleMarkerTTL = %s, want %s", got, DefaultCacheTTL)
+	}
+
+	const long = 30 * 24 * time.Hour
+	h := NewHandlerWithOptions(plainCache{inner: NewMemoryCache()}, upstream,
+		&HandlerOptions{StaleMarkerTTL: long})
+	if got := h.staleMarkerTTL(); got != long {
+		t.Fatalf("staleMarkerTTL = %s, want %s", got, long)
+	}
+
+	h.recordStale("k")
+
+	// Well past DefaultCacheTTL, but inside the configured retention. The
+	// sweep runs on each unsafe request, so drive one.
+	now = now.Add(DefaultCacheTTL + 24*time.Hour)
+	h.recordStale("other")
+
+	if _, marked := h.staleAt("k"); !marked {
+		t.Error("the marker was swept after DefaultCacheTTL despite a longer StaleMarkerTTL")
+	}
+
+	// And it IS swept once past the configured retention.
+	now = now.Add(long)
+	h.recordStale("third")
+	if _, marked := h.staleAt("k"); marked {
+		t.Error("the marker outlived the configured StaleMarkerTTL")
+	}
+}

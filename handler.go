@@ -50,6 +50,18 @@ var cacheableByDefault = map[int]bool{
 // if nil, the package-level logger (see SetLogger) is used.
 type HandlerOptions struct {
 	Logger *logger.Logger
+
+	// StaleMarkerTTL is how long the handler remembers an invalidation for a
+	// Cache that does not implement StaleAt itself.
+	//
+	// It must be at least as long as that Cache retains entries: the marker is
+	// the only record that entries older than it are pre-mutation, so expiring
+	// it first republishes them as fresh. Only the implementation knows its
+	// own retention, which is why this is a knob rather than a constant.
+	//
+	// Zero means DefaultCacheTTL. A Cache that implements StaleAt keeps its
+	// own record and ignores this.
+	StaleMarkerTTL time.Duration
 }
 
 type Handler struct {
@@ -79,6 +91,9 @@ type Handler struct {
 	// localStale records invalidation times for a Cache that cannot report
 	// them itself. Unused when the cache implements staleAtChecker.
 	localStale map[string]time.Time
+	// localStaleTTL is how long those markers are kept; see
+	// HandlerOptions.StaleMarkerTTL.
+	localStaleTTL time.Duration
 }
 
 type missFlight struct {
@@ -119,6 +134,9 @@ func NewHandlerWithOptions(cache Cache, upstream http.Handler, opts *HandlerOpti
 	}
 	if opts != nil && opts.Logger != nil {
 		h.log = opts.Logger
+	}
+	if opts != nil && opts.StaleMarkerTTL > 0 {
+		h.localStaleTTL = opts.StaleMarkerTTL
 	}
 	return h
 }
@@ -228,7 +246,16 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		h.debugf("validating cached response")
 		if h.validator.Validate(r, res) {
 			h.debugf("response is valid")
-			_ = h.cache.Freshen(res, cReq.Key.String())
+			// Both the base key and the VARIANT that was actually retrieved.
+			// Freshening only the base left the variant's stored Proxy-Date
+			// older than the base marker, so it was marked stale again on the
+			// very next request and revalidated upstream every time until the
+			// marker was swept.
+			keys := []string{cReq.Key.String()}
+			if cReq.servedKey != "" && cReq.servedKey != keys[0] {
+				keys = append(keys, cReq.servedKey)
+			}
+			_ = h.cache.Freshen(res, keys...)
 		} else {
 			h.debugf("response is changed")
 			_ = res.Close()
@@ -673,7 +700,7 @@ func (h *Handler) recordStale(keys ...string) {
 	}
 
 	now := Clock()
-	cutoff := now.Add(-localStaleRetention)
+	cutoff := now.Add(-h.staleMarkerTTL())
 
 	h.localStaleMu.Lock()
 	defer h.localStaleMu.Unlock()
@@ -771,14 +798,22 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 	}()
 }
 
-// localStaleRetention is how long the handler keeps its own invalidation
-// markers for a Cache that cannot report them.
+// defaultStaleMarkerTTL is the handler's marker retention when
+// HandlerOptions.StaleMarkerTTL is not set.
 //
-// It has to outlast any entry those markers judge, and the handler cannot ask
-// a third-party Cache how long it keeps things, so this is the built-in
-// cache's own default item TTL. A Cache retaining entries for longer should
-// implement staleAtChecker, which is bounded by its real TTL.
-const localStaleRetention = DefaultCacheTTL
+// The built-in cache's own default item TTL, which is the only retention the
+// handler can guess at. A Cache keeping entries for longer must say so through
+// StaleMarkerTTL, or implement staleAtChecker and keep the record itself --
+// expiring a marker before the entries it judges republishes them as fresh.
+const defaultStaleMarkerTTL = DefaultCacheTTL
+
+// staleMarkerTTL is the configured handler-side marker retention.
+func (h *Handler) staleMarkerTTL() time.Duration {
+	if h.localStaleTTL > 0 {
+		return h.localStaleTTL
+	}
+	return defaultStaleMarkerTTL
+}
 
 // staleAtChecker is an optional Cache capability: when a key was invalidated.
 //
@@ -820,7 +855,8 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 		baseStale := res.IsStale()
 		baseKey := req.Key.String()
 
-		varied, varyErr := h.cache.Retrieve(req.Key.Vary(vary, req.Request).String())
+		variantKey := req.Key.Vary(vary, req.Request).String()
+		varied, varyErr := h.cache.Retrieve(variantKey)
 		// The primary entry is not the one we serve, and nothing else will
 		// close it. Releasing it here is what keeps the disk backend from
 		// leaking a file handle on every Vary lookup.
@@ -861,6 +897,7 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 				varied.MarkStale()
 			}
 		}
+		req.servedKey = variantKey
 		res = varied
 	}
 
@@ -872,6 +909,10 @@ type cacheRequest struct {
 	Key          Key
 	Time         time.Time
 	CacheControl CacheControl
+
+	// servedKey is the key lookup actually retrieved, which differs from Key
+	// when a Vary variant was selected.
+	servedKey string
 }
 
 func newCacheRequest(r *http.Request) (*cacheRequest, error) {
@@ -908,9 +949,16 @@ func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
 	// RawPath and the decoded "/objects/a/b" in Path, so dropping it produced
 	// an invalidation key for a different resource than the one a direct
 	// request is cached under.
-	ref := r.URL.ResolveReference(&url.URL{
-		Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery, ForceQuery: u.ForceQuery,
-	})
+	// An ABSOLUTE reference keeps its own path, empty included. Rebuilding it
+	// as a relative one and resolving against the request made
+	// "Location: http://example.org?q" inherit the mutation's path, so a
+	// mutation at /orders/1 invalidated "/orders/1?q" and left the named
+	// representation fresh. A genuinely relative query-only reference, "?q",
+	// still inherits it, which is what RFC 3986 says.
+	ref := &url.URL{Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery, ForceQuery: u.ForceQuery}
+	if u.Scheme == "" && u.Host == "" {
+		ref = r.URL.ResolveReference(ref)
+	}
 	target := *r.URL
 	// The scheme is part of the cache key, so an absolute target naming one
 	// must keep it. Cloning r.URL wholesale turned "Location:
