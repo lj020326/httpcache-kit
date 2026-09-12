@@ -618,6 +618,7 @@ func TestFallbackInvalidatesLateNonVaryStore(t *testing.T) {
 
 	second := httptest.NewRecorder()
 	h.ServeHTTP(second, httptest.NewRequest("GET", "http://example.org/thing", nil))
+	h.writes.Wait()
 	if got := atomic.LoadInt32(&getCalls); got != 2 {
 		t.Fatalf("upstream GET calls = %d, want 2; late old Store was served as a HIT", got)
 	}
