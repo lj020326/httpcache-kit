@@ -486,6 +486,9 @@ func TestCloseWaitsForCleanupLoop(t *testing.T) {
 		_ = c.Close()
 		close(closed)
 	}()
+	// Observe that Close has issued the stop request before asserting that it
+	// still waits for the active cleanup call.
+	<-c.stopChan
 	select {
 	case <-closed:
 		unblock()

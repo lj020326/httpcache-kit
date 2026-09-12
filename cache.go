@@ -110,12 +110,16 @@ type cache struct {
 	diskRoot string
 
 	// generationMu orders complete stores/freshens against the FINAL timestamp
-	// of an invalidation. It also keeps retrievals from straddling cleanup's
-	// removal of an expired file and the marker that governs it. Invalidate
-	// first installs a visible barrier marker, then waits here for older
-	// operations before replacing it with the timestamp that permanently judges
-	// their stored generations.
+	// of an invalidation. Invalidate first installs a visible barrier marker,
+	// then waits here for older writers before replacing it with the timestamp
+	// that permanently judges their stored generations.
 	generationMu sync.RWMutex
+
+	// cleanupMu makes removal of an expired file and its governing stale marker
+	// one observable transition for Retrieve. It is intentionally independent
+	// of generationMu: a pending invalidation writer must not block lookups that
+	// can already observe its published barrier.
+	cleanupMu sync.RWMutex
 
 	// stale map with mutex protection
 	stale           map[string]time.Time
@@ -510,8 +514,8 @@ func (c *cache) Retrieve(key string) (*Resource, error) {
 	// generation transition. Holding the read side from file open through the
 	// marker check means a retrieval either observes the old file WITH its
 	// marker, or starts after cleanup and cannot open the file at all.
-	c.generationMu.RLock()
-	defer c.generationMu.RUnlock()
+	c.cleanupMu.RLock()
+	defer c.cleanupMu.RUnlock()
 
 	hashedKey := hashKey(key)
 	bodyPath := bodyPrefix + formatPrefix + hashedKey
@@ -1055,14 +1059,14 @@ func (c *cache) Cleanup() CleanupResult {
 	// removal first creates a fresh-read window and lets a crash restore the
 	// old file without its marker. Use one cutoff instant for both sweeps so a
 	// boundary entry cannot fall between them as cleanup runs.
-	c.generationMu.Lock()
+	c.cleanupMu.Lock()
 	if c.config.TTL > 0 {
 		removed, bytes := c.cleanupTTLExpired(start)
 		result.RemovedItems += removed
 		result.RemovedBytes += bytes
 	}
 	result.RemovedStaleEntries = c.cleanupStaleMap(start)
-	c.generationMu.Unlock()
+	c.cleanupMu.Unlock()
 
 	// Enforce size limit
 	if c.config.MaxSize > 0 {
@@ -1246,6 +1250,8 @@ func (c *cache) Stats() CacheStats {
 func (c *cache) Purge() error {
 	c.generationMu.Lock()
 	defer c.generationMu.Unlock()
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
 
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
