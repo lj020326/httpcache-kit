@@ -474,15 +474,16 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 			return err
 		}
 		if hasExpectedSize && written != expectedSize {
-			bodyPath := bodyPrefix + formatPrefix + hashedKey
-			_ = c.fs.Remove(bodyPath)
-			return fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
+			err := fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
+			if discardErr := c.discardUnadmitted(hashedKey); discardErr != nil {
+				err = errors.Join(err, fmt.Errorf("discard incomplete entry for key %q: %w", key, discardErr))
+			}
+			return err
 		}
 		if !hasExpectedSize {
 			if err := c.evictIfNeeded(hashedKey, written+int64(len(headerData))); err != nil {
-				bodyPath := bodyPrefix + formatPrefix + hashedKey
-				if removeErr := c.fs.Remove(bodyPath); removeErr != nil && !vfs.IsNotExist(removeErr) {
-					err = errors.Join(err, fmt.Errorf("remove unadmitted body file %s: %w", bodyPath, removeErr))
+				if discardErr := c.discardUnadmitted(hashedKey); discardErr != nil {
+					err = errors.Join(err, fmt.Errorf("discard unadmitted entry for key %q: %w", key, discardErr))
 				}
 				return fmt.Errorf("failed to make room for key %q: %w", key, err)
 			}
@@ -490,8 +491,9 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 
 		headerBytes, err := c.storeSerializedHeader(headerData, key)
 		if err != nil {
-			bodyPath := bodyPrefix + formatPrefix + hashedKey
-			_ = c.fs.Remove(bodyPath)
+			if discardErr := c.discardUnadmitted(hashedKey); discardErr != nil {
+				err = errors.Join(err, fmt.Errorf("discard entry with incomplete header for key %q: %w", key, discardErr))
+			}
 			return err
 		}
 
@@ -987,6 +989,30 @@ func (c *cache) touchEntry(hashedKey string) {
 		entry.accessedAt = Clock()
 		c.lruList.MoveToFront(entry.element)
 	}
+}
+
+// discardUnadmitted removes every on-disk part and any old LRU record for a
+// key whose body was already overwritten but whose replacement could not be
+// committed. Leaving the previous header and metadata behind would make a
+// failed Store look like a counted cache entry even though its body is gone.
+func (c *cache) discardUnadmitted(hashedKey string) error {
+	c.lruMutex.Lock()
+	defer c.lruMutex.Unlock()
+
+	if entry, exists := c.lruIndex[hashedKey]; exists {
+		return c.removeEntry(entry)
+	}
+
+	var removeErr error
+	for _, path := range []string{
+		bodyPrefix + formatPrefix + hashedKey,
+		headerPrefix + formatPrefix + hashedKey,
+	} {
+		if err := c.fs.Remove(path); err != nil && !vfs.IsNotExist(err) {
+			removeErr = errors.Join(removeErr, fmt.Errorf("remove cache file %s: %w", path, err))
+		}
+	}
+	return removeErr
 }
 
 // removeEntry removes an entry from the cache and LRU tracking

@@ -376,6 +376,37 @@ func TestStoreRejectsAdmissionWhenNoVictimCanBeRemoved(t *testing.T) {
 	}
 }
 
+func TestRejectedUnknownLengthReplacementDiscardsOldMetadata(t *testing.T) {
+	config := DefaultCacheConfig().WithMaxSize(1 << 20).WithCleanupInterval(0)
+	c := NewMemoryCacheWithConfig(config).(*cache)
+	defer func() { _ = c.Close() }()
+
+	old := NewResourceBytes(http.StatusOK, []byte("old"), http.Header{
+		"Content-Length": {"3"},
+	})
+	if err := c.Store(old, "same-key"); err != nil {
+		t.Fatalf("Store(old): %v", err)
+	}
+	config.MaxSize = c.Stats().TotalSize
+
+	// With no Content-Length, Store learns the replacement size only after it
+	// has overwritten the body. Rejection must discard the old header and LRU
+	// record as well, leaving a consistent miss rather than ghost metadata.
+	replacement := NewResourceBytes(http.StatusOK, []byte(strings.Repeat("x", 512)), http.Header{})
+	if err := c.Store(replacement, "same-key"); err == nil {
+		t.Fatal("oversized unknown-length replacement was admitted")
+	}
+	if stats := c.Stats(); stats.ItemCount != 0 || stats.TotalSize != 0 {
+		t.Fatalf("rejected replacement left ghost metadata: %+v", stats)
+	}
+	if _, err := c.Retrieve("same-key"); err != ErrNotFoundInCache {
+		t.Fatalf("replacement key error = %v, want ErrNotFoundInCache", err)
+	}
+	if _, err := c.Header("same-key"); err != ErrNotFoundInCache {
+		t.Fatalf("replacement header error = %v, want ErrNotFoundInCache", err)
+	}
+}
+
 func TestStore_NoContentLength(t *testing.T) {
 	// Store with no Content-Length uses io.Copy path
 	cache := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0)).(*cache)
