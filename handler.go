@@ -7,9 +7,12 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	logger "github.com/soulteary/logger-kit/v2"
@@ -48,9 +51,29 @@ var cacheableByDefault = map[int]bool{
 // if nil, the package-level logger (see SetLogger) is used.
 type HandlerOptions struct {
 	Logger *logger.Logger
+
+	// StaleMarkerTTL is how long the handler remembers an invalidation for a
+	// Cache that does not implement StaleAt itself.
+	//
+	// It must be at least as long as that Cache retains entries: the marker is
+	// the only record that entries older than it are pre-mutation, so expiring
+	// it first republishes them as fresh. Only the implementation knows its
+	// own retention, which is why this is a knob rather than a constant.
+	//
+	// Zero means DefaultCacheTTL. A Cache that implements StaleAt keeps its
+	// own record and ignores this.
+	StaleMarkerTTL time.Duration
 }
 
 type Handler struct {
+	// Shared reports whether this cache is shared between users (a reverse
+	// proxy) rather than private to one (a browser-style cache).
+	//
+	// It defaults to false, which is the *private* cache profile: responses
+	// marked "Cache-Control: private" and responses to requests carrying an
+	// Authorization header are storable. Deploying a shared cache without
+	// setting this serves one user's response to another. Prefer
+	// NewSharedHandler, which cannot be forgotten.
 	Shared    bool
 	upstream  http.Handler
 	validator *Validator
@@ -63,15 +86,45 @@ type Handler struct {
 	closing     bool
 	flightsMu   sync.Mutex
 	flights     map[string]*missFlight
+
+	// localStaleMu guards localStale and localFresh.
+	localStaleMu sync.Mutex
+	// localStale records invalidation times for a Cache that cannot report
+	// them itself. Unused when the cache implements staleAtChecker.
+	localStale map[string]time.Time
+	// localFresh records full-precision fetch/validation generations for a
+	// third-party Cache. Such a cache may return Resources without SetStoredAt,
+	// leaving only second-granular HTTP dates; a validation in the same second
+	// as a mutation would otherwise remain stale for the marker's lifetime.
+	localFresh map[string]time.Time
+	// localStaleTTL is how long those markers are kept; see
+	// HandlerOptions.StaleMarkerTTL.
+	localStaleTTL time.Duration
 }
 
 type missFlight struct {
 	done chan struct{}
 }
 
-// NewHandler returns a cache handler with default options (package-level logger).
+// NewHandler returns a private cache handler with default options
+// (package-level logger). Use NewSharedHandler for a cache that is shared
+// between users, such as a reverse proxy.
 func NewHandler(cache Cache, upstream http.Handler) *Handler {
 	return NewHandlerWithOptions(cache, upstream, nil)
+}
+
+// NewSharedHandler returns a cache handler configured as a shared cache: it
+// refuses to store "Cache-Control: private" responses and responses to
+// authorized requests unless they are explicitly marked public or carry
+// s-maxage, and it strips headers listed in "private" before storing.
+//
+// This is the constructor to use for a reverse proxy. NewHandler leaves
+// Shared false, which is correct for a per-user cache and unsafe for a
+// shared one.
+func NewSharedHandler(cache Cache, upstream http.Handler) *Handler {
+	h := NewHandlerWithOptions(cache, upstream, nil)
+	h.Shared = true
+	return h
 }
 
 // NewHandlerWithOptions returns a cache handler with the given options.
@@ -87,6 +140,9 @@ func NewHandlerWithOptions(cache Cache, upstream http.Handler, opts *HandlerOpti
 	}
 	if opts != nil && opts.Logger != nil {
 		h.log = opts.Logger
+	}
+	if opts != nil && opts.StaleMarkerTTL > 0 {
+		h.localStaleTTL = opts.StaleMarkerTTL
 	}
 	return h
 }
@@ -154,35 +210,37 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			h.metrics.RecordCacheMiss(r.Method)
 		}
 		flight, leader := h.claimMiss(cReq.Key.String())
-		if !leader {
-			select {
-			case <-flight.done:
-				res, err = h.lookup(cReq)
-				if err == nil {
-					res.Header().Set(CacheHeader, "HIT")
-					if h.metrics != nil {
-						h.metrics.RecordCacheHit(r.Method)
-					}
-					h.serveResource(res, rw, cReq)
-					_ = res.Close()
-					return
-				}
+		if leader {
+			h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
+			return
+		}
+
+		select {
+		case <-flight.done:
+			res, err = h.lookup(cReq)
+			if err != nil {
 				// The leader could not cache the response. Fall through to an
 				// uncoupled upstream request so followers are never stranded.
 				h.passUpstream(rw, cReq, nil)
 				return
-			case <-r.Context().Done():
-				return
 			}
+			// Continue through the ordinary cache-hit path. Invalidation may
+			// race the leader's completed Store and mark this response stale
+			// before the follower wakes, so it must not bypass validation.
+		case <-r.Context().Done():
+			return
 		}
-		h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
-		return
-	} else {
-		h.debugf("%s %s found in %s cache", r.Method, r.URL.String(), cacheType)
 	}
+
+	h.debugf("%s %s found in %s cache", r.Method, r.URL.String(), cacheType)
 
 	if h.needsValidation(res, cReq) {
 		if cReq.CacheControl.Has("only-if-cached") {
+			// res came from the cache and is not served; both early returns
+			// in this block leave it open otherwise, and the disk backend
+			// holds a file descriptor per retrieved resource. Every stale
+			// entry lacking a validator took one on each refresh.
+			_ = res.Close()
 			http.Error(rw, "key was in cache, but required validation",
 				http.StatusGatewayTimeout)
 			return
@@ -191,9 +249,51 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		h.debugf("validating cached response")
 		if h.validator.Validate(r, res) {
 			h.debugf("response is valid")
-			_ = h.cache.Freshen(res, cReq.Key.String())
+			// Both the base key and the VARIANT that was actually retrieved.
+			// Freshening only the base left the variant's stored Proxy-Date
+			// older than the base marker, so it was marked stale again on the
+			// very next request and revalidated upstream every time until the
+			// marker was swept.
+			keys := []string{cReq.Key.String()}
+			if cReq.servedKey != "" && cReq.servedKey != keys[0] {
+				keys = append(keys, cReq.servedKey)
+			}
+			if err := h.cache.Freshen(res, keys...); err != nil {
+				// The validation may have raced a newer invalidation, or the
+				// cache may have failed to persist it. Serving the old body as a
+				// HIT would be unsafe; fetch the current representation in full.
+				h.debugf("freshening cached response failed: %v", err)
+				_ = res.Close()
+				h.passUpstream(rw, cReq, nil)
+				return
+			}
+			// Invalidate publishes its barrier before it waits for an active
+			// Freshen's generation read lock. The marker can therefore advance
+			// after Freshen's initial check but before its header write returns.
+			// Recheck the validation START time now; the later header timestamp
+			// is not proof that a request begun before that mutation is current.
+			for key, staleAt := range h.staleSnapshot(keys) {
+				if !res.ReceivedAfter(staleAt) {
+					h.debugf("validation for %q was superseded after freshening by invalidation at %s", key, staleAt)
+					_ = res.Close()
+					h.passUpstream(rw, cReq, nil)
+					return
+				}
+			}
+			// Validator records the precise instant at which the conditional
+			// request began. cReq.Time predates cache lookup and can therefore
+			// precede a concurrent mutation even though validation itself began
+			// after it.
+			h.recordFresh(res.RequestTime, keys...)
+			// lookup marked this in-memory Resource stale before validation.
+			// Freshen advances the persisted generation, but it cannot clear the
+			// flag on the object we are about to serve; do that only after the
+			// ordered Freshen succeeds so Warning: 110 is not emitted for a
+			// response just validated against the origin.
+			res.markFresh()
 		} else {
 			h.debugf("response is changed")
+			_ = res.Close()
 			h.passUpstream(rw, cReq, nil)
 			return
 		}
@@ -248,13 +348,18 @@ func (h *Handler) freshness(res *Resource, r *cacheRequest) (time.Duration, erro
 }
 
 func (h *Handler) needsValidation(res *Resource, r *cacheRequest) bool {
-	if res.MustValidate(h.Shared) {
-		return true
-	}
-
 	freshness, err := h.freshness(res, r)
 	if err != nil {
 		h.debugf("error calculating freshness: %s", err.Error())
+		return true
+	}
+
+	// must-revalidate, proxy-revalidate, and s-maxage constrain reuse only
+	// after the stored response has become stale. A still-fresh response is
+	// reusable without a conditional request even when it has no validator.
+	// Once stale, these directives also prohibit satisfying the request via
+	// max-stale, so check them before that exception below.
+	if freshness <= 0 && res.MustValidate(h.Shared) {
 		return true
 	}
 
@@ -295,6 +400,7 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 		h.upstream.ServeHTTP(w, r.Request)
 		return
 	}
+	rw.deferHeaders = r.isStateChanging()
 	rdr, err := rw.NextReader()
 	if err != nil {
 		h.debugf("error creating next stream reader: %v", err)
@@ -311,18 +417,34 @@ func (h *Handler) pipeUpstream(w http.ResponseWriter, r *cacheRequest) {
 	}()
 	rw.WaitHeaders()
 
-	if r.Method != "HEAD" && !r.isStateChanging() {
+	if r.isStateChanging() {
+		// A mutation's status and invalidation headers are complete as soon as
+		// WriteHeader returns. Invalidate before committing them to the client:
+		// once a successful mutation status is observable, a dependent GET must
+		// no longer be able to use the pre-mutation representation. Do not wait
+		// for the body, which an upstream may stream for a long time.
+		res := NewResourceBytes(rw.StatusCode, nil, rw.responseHeader)
+		if res.IsNonErrorStatus() {
+			h.invalidateResource(res, r)
+		}
+		rw.CommitHeaders()
+		_, _ = io.Copy(io.Discard, rdr)
+		return
+	}
+
+	if r.Method != "HEAD" {
+		// responseStreamer writes to the pipe before it writes to the client.
+		// Keep consuming the pipe until the upstream handler finishes; closing
+		// the reader as soon as headers arrive makes a handler whose first call
+		// is Write fail that write before the client receives its body.
+		_, _ = io.Copy(io.Discard, rdr)
 		return
 	}
 
 	res := rw.Resource()
 	defer func() { _ = res.Close() }()
 
-	if r.Method == "HEAD" {
-		_ = h.cache.Freshen(res, r.Key.ForMethod("GET").String())
-	} else if res.IsNonErrorStatus() {
-		h.invalidateResource(res, r)
-	}
+	_ = h.cache.Freshen(res, r.Key.ForMethod("GET").String())
 }
 
 // passUpstream makes the request via the upstream handler and stores the result
@@ -358,6 +480,10 @@ func (h *Handler) passUpstream(w http.ResponseWriter, r *cacheRequest, complete 
 
 	// just the headers! Use a clone so storeResource can mutate (e.g. RemovePrivateHeaders) without racing with the client reading rw.Header().
 	res := NewResourceBytes(rw.StatusCode, nil, rw.Header().Clone())
+	// Store the precise local start of this upstream fetch. The cache uses it
+	// to order an in-flight response against a concurrent invalidation without
+	// relying on second-granular HTTP dates.
+	res.RequestTime = t
 	if !h.isCacheable(res, r) {
 		h.debugf("resource is uncacheable")
 		rw.Header().Set(CacheHeader, "SKIP")
@@ -602,15 +728,186 @@ func (h *Handler) serveResource(res *Resource, w http.ResponseWriter, req *cache
 	}
 }
 
+// invalidateResource invalidates the cache entries that a successful unsafe
+// request has made stale, per RFC 7234 section 4.4.
+//
+// This used to only log: nothing was ever invalidated, so a resource that had
+// been POSTed to, PUT or DELETEd kept being served from cache until its own
+// freshness lifetime ran out.
 func (h *Handler) invalidateResource(res *Resource, r *cacheRequest) {
-	if !h.beginWrite() {
+	keys := invalidationKeys(res, r)
+	if len(keys) == 0 {
+		return
+	}
+	// Synchronously, before ServeHTTP returns.
+	//
+	// Invalidate only writes stale markers under a mutex, so there is nothing
+	// to gain by deferring it -- and deferring it left a window in which the
+	// unsafe request had already been answered while the previous
+	// representation was still considered fresh, so an immediate or concurrent
+	// GET could be served stale content after a successful mutation.
+	h.recordStale(keys...)
+	h.cache.Invalidate(keys...)
+	h.debugf("invalidated %d key(s) after %s %s: %q", len(keys), r.Method, r.URL, keys)
+}
+
+// recordStale notes when keys were invalidated, for a Cache that cannot.
+//
+// A cache implementing staleAtChecker keeps this itself, so nothing is
+// recorded for one; only a third-party Cache reaches this map.
+func (h *Handler) recordStale(keys ...string) {
+	if _, ok := h.cache.(staleAtChecker); ok {
 		return
 	}
 
-	go func() {
-		defer h.endWrite()
-		h.debugf("invalidating resource %+v", res)
-	}()
+	now := Clock()
+	cutoff := now.Add(-h.staleMarkerTTL())
+
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+
+	if h.localStale == nil {
+		h.localStale = make(map[string]time.Time)
+	}
+	// Swept opportunistically here rather than on a timer: the map only grows
+	// when unsafe requests arrive, so that is also when it is worth pruning.
+	for key, at := range h.localStale {
+		if at.Before(cutoff) {
+			delete(h.localStale, key)
+		}
+	}
+	for key, at := range h.localFresh {
+		if at.Before(cutoff) {
+			delete(h.localFresh, key)
+		}
+	}
+	for _, key := range keys {
+		h.localStale[key] = now
+	}
+}
+
+// recordFresh notes the precise generation represented by keys when the
+// Cache cannot expose one itself. at is the start of the upstream fetch or
+// validation, rather than its completion, so an operation already in flight
+// when a mutation occurs cannot make older content appear newer.
+func (h *Handler) recordFresh(at time.Time, keys ...string) {
+	if _, ok := h.cache.(staleAtChecker); ok {
+		return
+	}
+	if at.IsZero() {
+		at = Clock()
+	}
+
+	cutoff := Clock().Add(-h.staleMarkerTTL())
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	if h.localFresh == nil {
+		h.localFresh = make(map[string]time.Time)
+	}
+	for key, recordedAt := range h.localFresh {
+		if recordedAt.Before(cutoff) {
+			delete(h.localFresh, key)
+		}
+	}
+	for _, key := range keys {
+		if previous, ok := h.localFresh[key]; !ok || at.After(previous) {
+			h.localFresh[key] = at
+		}
+	}
+}
+
+// locallyFreshAfter reports whether the handler observed key being fetched or
+// validated after an invalidation. It supplies the precision that the Cache
+// interface cannot require from existing third-party implementations.
+func (h *Handler) locallyFreshAfter(key string, staleAt time.Time) bool {
+	if _, ok := h.cache.(staleAtChecker); ok {
+		return false
+	}
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	at, ok := h.localFresh[key]
+	return ok && at.After(staleAt)
+}
+
+// resourceFreshAfter uses the generation evidence owned by the component that
+// also owns invalidation ordering. A cache exposing StaleAt can compare its
+// full-precision stored generation. For an opaque third-party cache, only the
+// handler's request/validation start record proves that work did not begin
+// before the mutation; a later file-write timestamp does not.
+func (h *Handler) resourceFreshAfter(res *Resource, key string, staleAt time.Time) bool {
+	if _, ok := h.cache.(staleAtChecker); ok {
+		return res.StoredAfter(staleAt)
+	}
+	return h.locallyFreshAfter(key, staleAt)
+}
+
+// staleAt reports when key was invalidated, from whichever record exists.
+func (h *Handler) staleAt(key string) (time.Time, bool) {
+	if checker, ok := h.cache.(staleAtChecker); ok {
+		return checker.StaleAt(key)
+	}
+
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	at, ok := h.localStale[key]
+	return at, ok
+}
+
+// staleSnapshot reads the governed base/variant marker set at one
+// linearization point whenever the cache supports it. Handler-owned fallback
+// markers are copied under their single mutex. A legacy cache exposing only
+// StaleAt is queried in reverse order so the normally governing base key
+// (first in keys) is read last.
+func (h *Handler) staleSnapshot(keys []string) map[string]time.Time {
+	if checker, ok := h.cache.(staleSnapshotChecker); ok {
+		return checker.StaleSnapshot(keys...)
+	}
+	if checker, ok := h.cache.(staleAtChecker); ok {
+		snapshot := make(map[string]time.Time, len(keys))
+		for i := len(keys) - 1; i >= 0; i-- {
+			if at, marked := checker.StaleAt(keys[i]); marked {
+				snapshot[keys[i]] = at
+			}
+		}
+		return snapshot
+	}
+
+	h.localStaleMu.Lock()
+	defer h.localStaleMu.Unlock()
+	snapshot := make(map[string]time.Time, len(keys))
+	for _, key := range keys {
+		if at, marked := h.localStale[key]; marked {
+			snapshot[key] = at
+		}
+	}
+	return snapshot
+}
+
+// invalidationKeys returns the cache keys made stale by a successful unsafe
+// request: the effective request URI, plus the URIs named by the response's
+// Location and Content-Location headers.
+//
+// Both GET and HEAD keys are invalidated, because a HEAD response may have
+// been stored separately. Cross-origin targets are ignored — a response must
+// not be able to evict another origin's entries.
+func invalidationKeys(res *Resource, r *cacheRequest) []string {
+	base := NewKey("GET", r.URL, r.Header)
+	keys := []string{base.String(), base.ForMethod("HEAD").String()}
+
+	for _, header := range []string{"Location", "Content-Location"} {
+		raw := res.Header().Get(header)
+		if raw == "" {
+			continue
+		}
+		u := r.sameOriginURL(raw)
+		if u == nil {
+			debugf("ignoring cross-origin or unparseable %s %q", header, raw)
+			continue
+		}
+		k := NewKey("GET", u, r.Header)
+		keys = append(keys, k.String(), k.ForMethod("HEAD").String())
+	}
+	return keys
 }
 
 func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func()) {
@@ -643,6 +940,7 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 				h.metrics.RecordStoreOperation(false)
 			}
 		} else {
+			h.recordFresh(r.Time, keys...)
 			if h.metrics != nil {
 				h.metrics.RecordStoreOperation(true)
 			}
@@ -652,26 +950,73 @@ func (h *Handler) storeResource(res *Resource, r *cacheRequest, complete func())
 	}()
 }
 
+// defaultStaleMarkerTTL is the handler's marker retention when
+// HandlerOptions.StaleMarkerTTL is not set.
+//
+// The built-in cache's own default item TTL, which is the only retention the
+// handler can guess at. A Cache keeping entries for longer must say so through
+// StaleMarkerTTL, or implement staleAtChecker and keep the record itself --
+// expiring a marker before the entries it judges republishes them as fresh.
+const defaultStaleMarkerTTL = DefaultCacheTTL
+
+// staleMarkerTTL is the configured handler-side marker retention.
+func (h *Handler) staleMarkerTTL() time.Duration {
+	if h.localStaleTTL > 0 {
+		return h.localStaleTTL
+	}
+	return defaultStaleMarkerTTL
+}
+
+// staleAtChecker is an optional Cache capability: when a key was invalidated.
+//
+// The built-in cache implements it. A third-party Cache that does not simply
+// gets the coarser base-entry fallback in lookup.
+type staleAtChecker interface {
+	StaleAt(key string) (time.Time, bool)
+}
+
+// staleSnapshotChecker is the multi-key form used after validating a Vary
+// response. Implementations return all requested markers from one generation.
+type staleSnapshotChecker interface {
+	StaleSnapshot(keys ...string) map[string]time.Time
+}
+
 // lookupResource finds the best matching Resource for the
 // request, or nil and ErrNotFoundInCache if none is found
 func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
-	res, err := h.cache.Retrieve(req.Key.String())
+	lookupKey := req.Key
+	baseKey := lookupKey.String()
+	res, err := h.cache.Retrieve(baseKey)
 
 	// HEAD requests can possibly be served from GET
 	if err == ErrNotFoundInCache && req.Method == "HEAD" {
-		res, err = h.cache.Retrieve(req.Key.ForMethod("GET").String())
+		lookupKey = req.Key.ForMethod("GET")
+		baseKey = lookupKey.String()
+		res, err = h.cache.Retrieve(baseKey)
 		if err != nil {
 			return nil, err
 		}
 
 		if res.HasExplicitExpiration() && req.isCacheable() {
 			h.debugf("using cached GET request for serving HEAD")
-			return res, nil
+			req.servedKey = baseKey
 		} else {
+			_ = res.Close()
 			return nil, ErrNotFoundInCache
 		}
 	} else if err != nil {
 		return res, err
+	}
+
+	// A third-party Cache can complete a pre-mutation background Store after
+	// its own Invalidate call. The handler's generation record is what prevents
+	// that ordinary (non-Vary) base entry from being republished as a fresh HIT.
+	// Built-in caches reach the same conclusion through StoredAt/StaleAt, so the
+	// check is harmless for them as well.
+	if staleAt, marked := h.staleAt(baseKey); marked {
+		if !h.resourceFreshAfter(res, baseKey, staleAt) {
+			res.MarkStale()
+		}
 	}
 
 	// Secondary lookup for Vary
@@ -680,10 +1025,56 @@ func (h *Handler) lookup(req *cacheRequest) (*Resource, error) {
 			_ = res.Close()
 			return nil, ErrNotFoundInCache
 		}
-		res, err = h.cache.Retrieve(req.Key.Vary(vary, req.Request).String())
-		if err != nil {
-			return res, err
+		// Whether the BASE entry was invalidated, read before it is closed.
+		baseStale := res.IsStale()
+		variantKey := lookupKey.Vary(vary, req.Request).String()
+		varied, varyErr := h.cache.Retrieve(variantKey)
+		// The primary entry is not the one we serve, and nothing else will
+		// close it. Releasing it here is what keeps the disk backend from
+		// leaking a file handle on every Vary lookup.
+		_ = res.Close()
+		if varyErr != nil {
+			return varied, varyErr
 		}
+
+		// An invalidated base entry invalidates its variants.
+		//
+		// Invalidation marks the base GET/HEAD keys stale, but each variant is
+		// stored under its own Key.Vary(...) key, and the Cache interface
+		// cannot enumerate them. Without this, a request whose Vary headers
+		// matched an existing variant went on being served the pre-mutation
+		// representation, with no revalidation, after a successful
+		// POST/PUT/PATCH/DELETE.
+		//
+		// The variant is judged against the base key's invalidation TIME, not
+		// against whether the base entry currently reads as stale. Refetching
+		// one variant rewrites the base entry too, so a boolean would make
+		// every OTHER variant fresh again as soon as the first was replaced;
+		// comparing each variant's own Date against the marker keeps it stale
+		// until it is itself replaced.
+		if varied != nil {
+			// Each variant is judged against the BASE key's marker by its own
+			// receive time. A boolean would not do: refetching one variant
+			// rewrites the base entry, so every OTHER variant would go back to
+			// being a fresh HIT as soon as the first was replaced.
+			//
+			// h.staleAt reads the cache's own record when it keeps one, and
+			// the handler's otherwise -- the previous fallback to the base
+			// ENTRY's state reopened exactly that bug for third-party caches.
+			if staleAt, marked := h.staleAt(baseKey); marked {
+				// StoredAfter, not ReceivedAfter: HTTP dates are
+				// second-granular and the marker is not, so a variant
+				// revalidated in the same second as the mutation could never
+				// clear it and was revalidated upstream on every request.
+				if !h.resourceFreshAfter(varied, variantKey, staleAt) {
+					varied.MarkStale()
+				}
+			} else if baseStale {
+				varied.MarkStale()
+			}
+		}
+		req.servedKey = variantKey
+		res = varied
 	}
 
 	return res, nil
@@ -694,6 +1085,10 @@ type cacheRequest struct {
 	Key          Key
 	Time         time.Time
 	CacheControl CacheControl
+
+	// servedKey is the key lookup actually retrieved, which differs from Key
+	// when a Vary variant was selected.
+	servedKey string
 }
 
 func newCacheRequest(r *http.Request) (*cacheRequest, error) {
@@ -714,12 +1109,129 @@ func newCacheRequest(r *http.Request) (*cacheRequest, error) {
 	}, nil
 }
 
+// sameOriginURL resolves raw against the request URI and returns it only when
+// it targets the same origin, shaped so that the resulting key matches what
+// NewRequestKey would build for a direct request to that path. Returns nil for
+// an unparseable or cross-origin reference.
+func (r *cacheRequest) sameOriginURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil
+	}
+	if u.Host != "" {
+		requestScheme := strings.ToLower(r.URL.Scheme)
+		if requestScheme == "" {
+			requestScheme = "http"
+			if r.TLS != nil {
+				requestScheme = "https"
+			}
+		}
+		targetScheme := strings.ToLower(u.Scheme)
+		if targetScheme == "" {
+			targetScheme = requestScheme
+		}
+
+		requestAuthority := r.Host
+		if requestAuthority == "" {
+			requestAuthority = r.URL.Host
+		}
+		requestHost, requestPort, requestOK := normalizedOriginAuthority(requestScheme, requestAuthority)
+		targetHost, targetPort, targetOK := normalizedOriginAuthority(targetScheme, u.Host)
+		if !requestOK || !targetOK || requestScheme != targetScheme ||
+			!strings.EqualFold(requestHost, targetHost) || requestPort != targetPort {
+			return nil
+		}
+	}
+	// RawPath is carried through: url.Parse records "/objects/a%2Fb" in
+	// RawPath and the decoded "/objects/a/b" in Path, so dropping it produced
+	// an invalidation key for a different resource than the one a direct
+	// request is cached under.
+	// An ABSOLUTE reference keeps its own path, empty included. Rebuilding it
+	// as a relative one and resolving against the request made
+	// "Location: http://example.org?q" inherit the mutation's path, so a
+	// mutation at /orders/1 invalidated "/orders/1?q" and left the named
+	// representation fresh. A genuinely relative query-only reference, "?q",
+	// still inherits it, which is what RFC 3986 says.
+	ref := &url.URL{Path: u.Path, RawPath: u.RawPath, RawQuery: u.RawQuery, ForceQuery: u.ForceQuery}
+	if u.Scheme == "" && u.Host == "" {
+		ref = r.URL.ResolveReference(ref)
+	}
+	target := *r.URL
+	originForm := r.URL.Scheme == "" && r.URL.Host == ""
+	// The scheme is part of an absolute-form cache key, so an absolute target
+	// keeps the scheme it explicitly named after the same-origin check above.
+	// A server normally receives origin-form request targets, where URL has
+	// neither Scheme nor Host and Host lives on the Request itself. Keep that
+	// shape even when Location is absolute: otherwise setting only Scheme
+	// produces "http:/item", a different key from the direct request's
+	// "/item". For absolute-form requests, the target's explicit scheme still
+	// belongs in the key.
+	if u.Scheme != "" && !originForm {
+		target.Scheme = u.Scheme
+	}
+	if u.Host != "" && !originForm {
+		// Origin equivalence does not imply identical URL spelling. Preserve an
+		// explicitly written default port so the invalidation key is identical
+		// to a direct absolute-form request for the URI named by Location.
+		target.Host = u.Host
+		target.User = u.User
+	}
+	target.Path = ref.Path
+	target.RawPath = ref.RawPath
+	// RFC 3986 treats an authority with an empty path as "/" for HTTP. Once
+	// an absolute or network-path target is reshaped to origin-form, keeping
+	// the empty path would make "?q" instead of the direct request's "/?q".
+	if originForm && (u.Scheme != "" || u.Host != "") && target.Path == "" {
+		target.Path = "/"
+	}
+	target.RawQuery = ref.RawQuery
+	// ForceQuery too, or "/item?" and "/item" produce the same key while
+	// NewRequestKey keeps them apart -- and, because target starts as a clone
+	// of the mutation's URL, an inherited ForceQuery would otherwise add a "?"
+	// to a target that never had one.
+	target.ForceQuery = ref.ForceQuery
+	target.Fragment = ""
+	return &target
+}
+
+// normalizedOriginAuthority separates a URL authority into its case-insensitive
+// host and effective port. An omitted HTTP(S) default port is equivalent to an
+// explicitly written one, which a raw comparison of url.URL.Host cannot see.
+func normalizedOriginAuthority(scheme, authority string) (host, port string, ok bool) {
+	u, err := url.Parse("//" + authority)
+	if err != nil || u.Host == "" {
+		return "", "", false
+	}
+	host = u.Hostname()
+	if host == "" {
+		return "", "", false
+	}
+	port = u.Port()
+	if port == "" {
+		switch strings.ToLower(scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	} else {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil {
+			return "", "", false
+		}
+		port = strconv.FormatUint(n, 10)
+	}
+	return host, port, true
+}
+
 func (r *cacheRequest) isStateChanging() bool {
 	switch r.Method {
-	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
-		return true
-	default:
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
 		return false
+	default:
+		// HTTP invalidation is defined for every unsafe method, including
+		// extension methods such as WebDAV PROPPATCH, MKCOL, and MOVE.
+		return true
 	}
 }
 
@@ -808,6 +1320,7 @@ func newResponseStreamer(w http.ResponseWriter) (*responseStreamer, error) {
 		pipeReader:     pr,
 		pipeWriter:     pw,
 		C:              make(chan struct{}),
+		commitC:        make(chan struct{}),
 	}, nil
 }
 
@@ -816,9 +1329,34 @@ type responseStreamer struct {
 	http.ResponseWriter
 	pipeReader *io.PipeReader
 	pipeWriter *io.PipeWriter
+	// deferHeaders keeps a state-changing response private until its cache
+	// invalidation has completed. Header must therefore return bufferedHeader
+	// rather than exposing the wrapped writer's live header map.
+	deferHeaders   bool
+	bufferedHeader http.Header
+	// responseHeader is the immutable header snapshot that was committed with
+	// StatusCode. It is published by closing C, so WaitHeaders observes both,
+	// even when the actual client commit is deliberately deferred.
+	responseHeader http.Header
 	// C is closed by WriteHeader to signal the headers' writing. headerOnce ensures it is closed at most once.
 	C          chan struct{}
+	commitC    chan struct{}
 	headerOnce sync.Once
+	commitOnce sync.Once
+	committed  atomic.Bool
+}
+
+// Header implements http.ResponseWriter. Ordinary responses retain the
+// wrapped writer's behavior. State-changing responses use a private copy so
+// neither their status nor headers become observable before invalidation.
+func (rw *responseStreamer) Header() http.Header {
+	if !rw.deferHeaders || rw.committed.Load() {
+		return rw.ResponseWriter.Header()
+	}
+	if rw.bufferedHeader == nil {
+		rw.bufferedHeader = rw.ResponseWriter.Header().Clone()
+	}
+	return rw.bufferedHeader
 }
 
 // WaitHeaders returns when WriteHeader has been called (i.e. rw.C is closed).
@@ -827,21 +1365,78 @@ func (rw *responseStreamer) WaitHeaders() {
 	}
 }
 
-// WriteHeader implements http.ResponseWriter. Safe if called more than once; only the first call closes C and writes the status.
-// C is closed only after status and headers are written so that WaitHeaders() callers observe consistent state (no data race).
+// WriteHeader implements http.ResponseWriter. Safe if called more than once;
+// only the first call publishes the status and immutable header snapshot.
 func (rw *responseStreamer) WriteHeader(status int) {
+	waitForCommit := false
 	rw.headerOnce.Do(func() {
 		rw.StatusCode = status
-		rw.ResponseWriter.WriteHeader(status)
+		rw.responseHeader = rw.Header().Clone()
+		if rw.deferHeaders {
+			waitForCommit = true
+		} else {
+			rw.CommitHeaders()
+		}
 		close(rw.C)
+	})
+	if waitForCommit {
+		// Prevent the upstream handler from changing deferred headers or
+		// publishing trailer values while CommitHeaders snapshots the former.
+		// It resumes as soon as invalidation and the client commit complete.
+		<-rw.commitC
+	}
+}
+
+// CommitHeaders makes the first status and its header snapshot observable to
+// the client. For a state-changing request pipeUpstream calls this only after
+// successful-response invalidation is complete.
+func (rw *responseStreamer) CommitHeaders() {
+	rw.commitOnce.Do(func() {
+		if rw.deferHeaders {
+			dst := rw.ResponseWriter.Header()
+			for name := range dst {
+				delete(dst, name)
+			}
+			for name, values := range rw.responseHeader {
+				dst[name] = append([]string(nil), values...)
+			}
+		}
+		rw.ResponseWriter.WriteHeader(rw.StatusCode)
+		// Once the initial headers are committed, Header must expose the
+		// wrapped map again. net/http handlers publish declared trailer values
+		// there after their body writes complete.
+		rw.committed.Store(true)
+		if rw.commitC != nil {
+			close(rw.commitC)
+		}
 	})
 }
 
+// Write implements http.ResponseWriter.
+//
+// It calls WriteHeader(StatusOK) first, as the interface requires: "If
+// WriteHeader has not yet been called, Write calls WriteHeader(http.StatusOK)
+// before writing the data."
+//
+// Without that, an upstream handler that only calls Write -- the ordinary way
+// to answer with 200 -- hung the request FOREVER. C was never closed, so
+// passUpstream sat in WaitHeaders and never reached the code that drains the
+// pipe, while the upstream goroutine blocked in this very call writing into a
+// pipe with no reader. Every test in this package happened to call WriteHeader
+// explicitly, so nothing caught it.
 func (rw *responseStreamer) Write(b []byte) (int, error) {
+	rw.WriteHeader(http.StatusOK)
 	return io.MultiWriter(rw.pipeWriter, rw.ResponseWriter).Write(b)
 }
 
+// Close finishes the upstream response.
+//
+// It signals the headers too, for the same reason Write does: a handler that
+// returns without writing anything at all still produced a 200, exactly as
+// net/http would send one, and WaitHeaders would otherwise block on a response
+// that is never coming.
 func (rw *responseStreamer) Close() error {
+	rw.WriteHeader(http.StatusOK)
 	return rw.pipeWriter.Close()
 }
 
@@ -853,14 +1448,18 @@ func (rw *responseStreamer) NextReader() (io.ReadCloser, error) {
 // Resource returns a copy of the responseStreamer as a Resource object
 func (rw *responseStreamer) Resource() *Resource {
 	b, err := io.ReadAll(rw.pipeReader)
+	header := rw.responseHeader
+	if header == nil {
+		header = rw.Header().Clone()
+	}
 	if err != nil {
 		return &Resource{
-			header:         rw.Header(),
+			header:         header,
 			statusCode:     rw.StatusCode,
 			ReadSeekCloser: errReadSeekCloser{err},
 		}
 	}
-	return NewResourceBytes(rw.StatusCode, b, rw.Header())
+	return NewResourceBytes(rw.StatusCode, b, header)
 }
 
 type errReadSeekCloser struct {

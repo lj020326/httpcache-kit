@@ -27,6 +27,7 @@ func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
 	cache := NewMemoryCache()
 	log := logger.Default()
 	h := NewHandlerWithOptions(cache, upstream, &HandlerOptions{Logger: log})
+	t.Cleanup(func() { h.writes.Wait() })
 	if h == nil {
 		t.Fatal("handler is nil")
 	}
@@ -36,6 +37,9 @@ func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("code: %d", rec.Code)
 	}
+	// passUpstream deliberately persists the body asynchronously; wait before
+	// making the request whose purpose is to exercise the cache-hit path.
+	h.writes.Wait()
 	// Trigger logRef with IsDebugLogging so handler uses injected logger for debugf
 	prev := IsDebugLogging()
 	SetDebugLogging(true)
@@ -519,6 +523,11 @@ func TestOnlyIfCached_InCacheNeedsValidation(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	Writes.Wait()
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatalf("newCacheRequest: %v", err)
+	}
+	cache.Invalidate(cReq.Key.String())
 	req2 := httptest.NewRequest("GET", "http://example.org/", nil)
 	req2.Header.Set("Cache-Control", "only-if-cached")
 	rec2 := httptest.NewRecorder()
@@ -815,7 +824,9 @@ func TestIsCacheable_StatusNotStoreable(t *testing.T) {
 func TestPipeUpstream_NonCacheableRequest(t *testing.T) {
 	upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "max-age=60")
-		w.WriteHeader(http.StatusOK)
+		// Deliberately let Write send the headers. pipeUpstream must keep its
+		// pipe reader alive after WaitHeaders returns or this write fails before
+		// responseStreamer can copy the body to the client.
 		_, _ = w.Write([]byte("ok"))
 	})
 	h := NewHandler(NewMemoryCache(), upstream)
@@ -829,6 +840,9 @@ func TestPipeUpstream_NonCacheableRequest(t *testing.T) {
 	}
 	if rec.Header().Get(CacheHeader) != "SKIP" {
 		t.Errorf("want X-Cache: SKIP, got %s", rec.Header().Get(CacheHeader))
+	}
+	if got := rec.Body.String(); got != "ok" {
+		t.Errorf("want body %q, got %q", "ok", got)
 	}
 }
 
@@ -967,6 +981,68 @@ func TestConcurrentMissesAreCollapsed(t *testing.T) {
 	}
 }
 
+type missThenStaleCache struct {
+	Cache
+	retrieves atomic.Int32
+	first     chan struct{}
+}
+
+func (c *missThenStaleCache) Retrieve(string) (*Resource, error) {
+	if c.retrieves.Add(1) == 1 {
+		close(c.first)
+		return nil, ErrNotFoundInCache
+	}
+	res := NewResourceBytes(http.StatusOK, []byte("before"), http.Header{
+		"Cache-Control": {"max-age=3600"},
+	})
+	res.MarkStale()
+	return res, nil
+}
+
+func TestMissFollowerRevalidatesResultInvalidatedAfterLeaderStore(t *testing.T) {
+	cache := &missThenStaleCache{Cache: NewMemoryCache(), first: make(chan struct{})}
+	var upstreamCalls atomic.Int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Cache-Control", "max-age=60")
+		_, _ = w.Write([]byte("after"))
+	})
+	h := NewHandler(cache, upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.org/item", nil)
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatalf("newCacheRequest: %v", err)
+	}
+	flight, leader := h.claimMiss(cReq.Key.String())
+	if !leader {
+		t.Fatal("failed to install the test's leader flight")
+	}
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(rec, req)
+	}()
+	<-cache.first
+
+	// The completed leader wakes the follower, whose second lookup observes a
+	// response invalidated between Store and wakeup. It must pass through the
+	// regular validation path rather than being served as an unconditional HIT.
+	h.finishMiss(cReq.Key.String(), flight)
+	<-done
+	h.writes.Wait()
+
+	if got := rec.Body.String(); got != "after" {
+		t.Fatalf("body = %q, want refreshed body after", got)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
 type blockingStoreCache struct {
 	Cache
 	started chan struct{}
@@ -1004,5 +1080,245 @@ func TestHandlerShutdownDrainsWrites(t *testing.T) {
 	close(cache.release)
 	if err := h.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown after releasing store: %v", err)
+	}
+}
+
+// closeCountingBody is a ReadSeekCloser that records how often it was closed.
+type closeCountingBody struct {
+	*bytes.Reader
+	closes int32
+}
+
+func (b *closeCountingBody) Close() error { atomic.AddInt32(&b.closes, 1); return nil }
+
+// staleResourceCache always hands back one caller-supplied resource. Store and
+// the rest go to a real cache, which drains the upstream stream -- a Store
+// that ignores its body deadlocks passUpstream against its own writer.
+type staleResourceCache struct {
+	Cache
+	res *Resource
+}
+
+func (c *staleResourceCache) Header(string) (Header, error) {
+	return Header{Header: c.res.Header(), StatusCode: c.res.Status()}, nil
+}
+func (c *staleResourceCache) Retrieve(string) (*Resource, error) { return c.res, nil }
+
+// TestRefetchWithoutValidatorClosesTheCachedResource is the regression test for
+// the early return added when a stale entry has neither ETag nor
+// Last-Modified. ServeHTTP goes straight to passUpstream and returns, skipping
+// the res.Close() at the end of the function -- so the disk backend held one
+// more file descriptor for every such refresh, and repeated expiry or
+// invalidation walked the process into its open-file limit.
+func TestRefetchWithoutValidatorClosesTheCachedResource(t *testing.T) {
+	body := &closeCountingBody{Reader: bytes.NewReader([]byte("cached"))}
+	// Stale, and nothing to revalidate WITH.
+	res := NewResource(http.StatusOK, body, http.Header{
+		"Cache-Control": {"max-age=0, must-revalidate"},
+		"Date":          {Clock().Format(http.TimeFormat)},
+	})
+
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=60")
+		_, _ = w.Write([]byte("fresh"))
+	})
+	h := NewHandler(&staleResourceCache{Cache: NewMemoryCache(), res: res}, upstream)
+	// storeResource runs in the background; without this it outlives the test
+	// and races the next one's Clock reassignment.
+	t.Cleanup(func() { h.writes.Wait() })
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://example.org/x", nil))
+
+	if got := rec.Body.String(); got != "fresh" {
+		t.Fatalf("body = %q, want the refetched %q", got, "fresh")
+	}
+	if atomic.LoadInt32(&body.closes) == 0 {
+		t.Error("the cached resource was not closed before the full refetch")
+	}
+}
+
+// TestSupersedingIsJudgedByLocalReceiveTime is the regression test for
+// deciding whether a stored response supersedes an invalidation from the
+// ORIGIN's Date header. A replacement carrying no Date -- which a direct
+// http.Handler upstream may well omit -- never satisfied it, so the key stayed
+// stale on every retrieval and was refetched until the marker was swept.
+func TestSupersedingIsJudgedByLocalReceiveTime(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	c := NewMemoryCacheWithConfig(DefaultCacheConfig().WithCleanupInterval(0))
+	defer func() { _ = c.Close() }()
+
+	if err := c.Store(NewResourceBytes(http.StatusOK, []byte("before"), http.Header{}), "k"); err != nil {
+		t.Fatal(err)
+	}
+	c.Invalidate("k")
+
+	// The replacement arrives a minute later with NO origin Date -- only the
+	// Proxy-Date the handler stamps from the local clock on receipt.
+	now = now.Add(time.Minute)
+	replacement := NewResourceBytes(http.StatusOK, []byte("after"), http.Header{
+		ProxyDateHeader: {Clock().Format(http.TimeFormat)},
+	})
+	if err := c.Store(replacement, "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := c.Retrieve("k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = got.Close() }()
+	if got.IsStale() {
+		t.Error("a replacement stored after the invalidation was still marked stale; it carried no origin Date")
+	}
+}
+
+// TestUpstreamWithoutExplicitWriteHeaderDoesNotHang is the regression test for
+// responseStreamer.Write not implying WriteHeader(StatusOK).
+//
+// http.ResponseWriter requires it, and an upstream that just writes a body --
+// the ordinary way to answer 200 -- relied on it. Without it C was never
+// closed, so passUpstream waited in WaitHeaders and never reached the code
+// that drains the pipe, while the upstream goroutine blocked in Write against
+// a pipe with no reader. The request hung forever. Every other test in this
+// package calls WriteHeader explicitly, which is why nothing caught it.
+func TestUpstreamWithoutExplicitWriteHeaderDoesNotHang(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		upstream http.HandlerFunc
+		want     int
+		wantBody string
+	}{
+		{
+			name: "writes a body without WriteHeader",
+			upstream: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Cache-Control", "max-age=60")
+				_, _ = w.Write([]byte("ok"))
+			},
+			want:     http.StatusOK,
+			wantBody: "ok",
+		},
+		{
+			name:     "writes nothing at all",
+			upstream: func(http.ResponseWriter, *http.Request) {},
+			want:     http.StatusOK,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHandler(NewMemoryCache(), tc.upstream)
+			t.Cleanup(func() { h.writes.Wait() })
+
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest("GET", "http://example.org/x", nil))
+				done <- rec
+			}()
+
+			select {
+			case rec := <-done:
+				if rec.Code != tc.want {
+					t.Errorf("status = %d, want %d", rec.Code, tc.want)
+				}
+				if got := rec.Body.String(); got != tc.wantBody {
+					t.Errorf("body = %q, want %q", got, tc.wantBody)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the request never completed; Write must imply WriteHeader(StatusOK)")
+			}
+		})
+	}
+}
+
+// --- Codex review round 5 (PR #5) ---
+
+// TestLookupRecordsTheServedVariantKey pins the mechanism the validation path
+// relies on. A successful revalidation used to freshen only the BASE key, so
+// the variant that was actually retrieved kept a Proxy-Date older than the
+// base marker and was marked stale again on the very next request --
+// revalidating upstream every time until the marker was swept.
+func TestLookupRecordsTheServedVariantKey(t *testing.T) {
+	var hits int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Vary", "Accept-Language")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("body"))
+	})
+
+	h := NewHandler(NewMemoryCache(), upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	req := httptest.NewRequest("GET", "http://example.org/thing", nil)
+	req.Header.Set("Accept-Language", "en")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	rec.Flush()
+	h.writes.Wait()
+
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := h.lookup(cReq)
+	if err != nil {
+		t.Fatalf("lookup error = %v", err)
+	}
+	defer func() { _ = res.Close() }()
+
+	want := cReq.Key.Vary("Accept-Language", req).String()
+	if cReq.servedKey != want {
+		t.Errorf("servedKey = %q, want the variant key %q", cReq.servedKey, want)
+	}
+	if cReq.servedKey == cReq.Key.String() {
+		t.Error("servedKey is the base key; the variant that was served is not recorded")
+	}
+}
+
+// TestStaleMarkerTTLIsConfigurable is the regression test for hard-coding the
+// handler's marker retention to DefaultCacheTTL. A third-party Cache keeping
+// entries longer than seven days lost the invalidation before its own entries
+// expired, so a pre-mutation Vary variant became a HIT again. Only the
+// implementation knows its retention, so it is a knob.
+func TestStaleMarkerTTLIsConfigurable(t *testing.T) {
+	originalClock := Clock
+	defer func() { Clock = originalClock }()
+	now := time.Now().UTC()
+	Clock = func() time.Time { return now }
+
+	upstream := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+
+	if got := NewHandler(plainCache{inner: NewMemoryCache()}, upstream).staleMarkerTTL(); got != DefaultCacheTTL {
+		t.Errorf("default staleMarkerTTL = %s, want %s", got, DefaultCacheTTL)
+	}
+
+	const long = 30 * 24 * time.Hour
+	h := NewHandlerWithOptions(plainCache{inner: NewMemoryCache()}, upstream,
+		&HandlerOptions{StaleMarkerTTL: long})
+	if got := h.staleMarkerTTL(); got != long {
+		t.Fatalf("staleMarkerTTL = %s, want %s", got, long)
+	}
+
+	h.recordStale("k")
+
+	// Well past DefaultCacheTTL, but inside the configured retention. The
+	// sweep runs on each unsafe request, so drive one.
+	now = now.Add(DefaultCacheTTL + 24*time.Hour)
+	h.recordStale("other")
+
+	if _, marked := h.staleAt("k"); !marked {
+		t.Error("the marker was swept after DefaultCacheTTL despite a longer StaleMarkerTTL")
+	}
+
+	// And it IS swept once past the configured retention.
+	now = now.Add(long)
+	h.recordStale("third")
+	if _, marked := h.staleAt("k"); marked {
+		t.Error("the marker outlived the configured StaleMarkerTTL")
 	}
 }

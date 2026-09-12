@@ -88,7 +88,7 @@ func (cc CacheControl) Duration(key string) (time.Duration, error) {
 }
 
 func (cc CacheControl) String() string {
-	keys := make([]string, len(cc))
+	keys := make([]string, 0, len(cc))
 	for k := range cc {
 		keys = append(keys, k)
 	}

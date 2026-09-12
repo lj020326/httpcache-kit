@@ -38,6 +38,9 @@ type Resource struct {
 	statusCode                int
 	cc                        CacheControl
 	stale                     bool
+	// storedAt is when THIS cache wrote the entry, at full precision. Zero
+	// for a resource that did not come out of a cache.
+	storedAt time.Time
 }
 
 func NewResource(statusCode int, body ReadSeekCloser, hdrs http.Header) *Resource {
@@ -74,6 +77,10 @@ func (r *Resource) IsStale() bool {
 
 func (r *Resource) MarkStale() {
 	r.stale = true
+}
+
+func (r *Resource) markFresh() {
+	r.stale = false
 }
 
 func (r *Resource) cacheControl() (CacheControl, error) {
@@ -138,6 +145,64 @@ func (r *Resource) DateAfter(d time.Time) bool {
 		}
 	}
 	return false
+}
+
+// ReceivedAfter reports whether this response reached the cache after d.
+//
+// It reads Proxy-Date, which the handler stamps from the LOCAL clock the
+// moment the upstream response arrives, and only falls back to the origin's
+// Date for a response stored without one.
+//
+// Deciding this from Date alone was wrong in both directions. A response that
+// carries no Date at all -- which a direct http.Handler upstream may well
+// omit -- never counted as superseding anything, so an invalidated key stayed
+// stale on every retrieval and was refetched until the marker was swept. An
+// origin whose clock trails the cache's did the same. Proxy-Date is always
+// present and always this machine's clock.
+//
+// Receive time, not store time: an older store still in flight when a
+// mutation lands carries a Proxy-Date from BEFORE the invalidation, so the
+// marker still wins and the pre-mutation body is not republished as fresh.
+//
+// Both stamps are HTTP dates, so this is second-granular: a replacement that
+// arrives in the same second as the invalidation does not count as
+// superseding it and is refetched once more. That is the safe direction to
+// round in.
+// SetStoredAt records when this cache wrote the entry.
+func (r *Resource) SetStoredAt(t time.Time) { r.storedAt = t }
+
+// StoredAfter reports whether this cache's copy is newer than d.
+//
+// It prefers the cache's OWN store time to the response's dates, because
+// Date and Proxy-Date are HTTP dates: one-second granularity, formatted with
+// http.TimeFormat. An invalidation marker is a full-precision time.Time, so a
+// response stored or revalidated in the same second as the invalidation is
+// never "after" it -- and being judged against a marker it can never clear,
+// the entry was re-marked stale and revalidated upstream on EVERY request
+// until the marker was swept. The store time is also ours rather than the
+// origin's, so a trailing origin clock cannot produce the same deadlock.
+//
+// Falls back to the header dates for a resource that did not come from this
+// cache, which is the only thing available for one.
+func (r *Resource) StoredAfter(d time.Time) bool {
+	if !r.storedAt.IsZero() {
+		return r.storedAt.After(d)
+	}
+	return r.ReceivedAfter(d)
+}
+
+func (r *Resource) ReceivedAfter(d time.Time) bool {
+	// For a live upstream response, RequestTime is the precise local instant
+	// at which the fetch or validation began. It is deliberately preferred to
+	// the later write time: a request already in flight when a mutation lands
+	// must not publish its possibly pre-mutation body afterwards.
+	if !r.RequestTime.IsZero() {
+		return r.RequestTime.After(d)
+	}
+	if t, err := timeHeader(ProxyDateHeader, r.header); err == nil {
+		return t.After(d)
+	}
+	return r.DateAfter(d)
 }
 
 // Calculate the age of the resource

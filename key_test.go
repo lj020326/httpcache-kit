@@ -80,14 +80,38 @@ func TestVaryKey(t *testing.T) {
 	}
 }
 
-func TestRequestKeyWithContentLocation(t *testing.T) {
+// TestRequestKeyIgnoresContentLocation pins the fix for a shared-cache
+// poisoning vector: a request header must never choose which entry a response
+// is stored under or looked up from. Before this, a client could request one
+// URL while naming another in Content-Location and have its own response
+// parked under the other URL's key.
+func TestRequestKeyIgnoresContentLocation(t *testing.T) {
 	r := newRequest("GET", "http://x.org/test1", "Content-Location: http://x.org/test2")
 
-	k1 := httpcache.NewKey("GET", mustParseUrl("http://x.org/test2"), nil)
-	k2 := httpcache.NewRequestKey(r)
+	other := httpcache.NewKey("GET", mustParseUrl("http://x.org/test2"), nil)
+	actual := httpcache.NewRequestKey(r)
 
-	if k1.String() != k2.String() {
-		t.Fatal("request key should with content location")
+	if actual.String() == other.String() {
+		t.Fatal("request Content-Location must not redirect the cache key")
+	}
+	expected := httpcache.NewKey("GET", mustParseUrl("http://x.org/test1"), nil)
+	if actual.String() != expected.String() {
+		t.Fatalf("key = %q, want the effective request URI key %q", actual.String(), expected.String())
+	}
+}
+
+// TestKeyEncodingIsInjective: the Vary section must not be forgeable from the
+// URL. The old encoding joined a raw URL and raw header values with ":" and
+// "::", so a URL containing the delimiters could collide with a different
+// URL's varied key.
+func TestKeyEncodingIsInjective(t *testing.T) {
+	varied := httpcache.NewKey("GET", mustParseUrl("http://x.org/a"), nil).
+		Vary("Accept-Encoding", newRequest("GET", "http://x.org/a", "Accept-Encoding: gzip"))
+
+	forged := httpcache.NewKey("GET", mustParseUrl("http://x.org/a::Accept-Encoding=gzip:"), nil)
+
+	if varied.String() == forged.String() {
+		t.Fatalf("crafted URL collides with a varied key: %q", forged.String())
 	}
 }
 

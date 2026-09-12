@@ -58,14 +58,16 @@ func TestSpecResponseCacheControl(t *testing.T) {
 		{cacheControl: "max-age=0, no-cache", requests: 2, cacheStatus: "SKIP"},
 		{cacheControl: "max-age=0", requests: 2, cacheStatus: "SKIP"},
 		{cacheControl: "s-maxage=0", requests: 2, cacheStatus: "SKIP", shared: true},
-		{cacheControl: "s-maxage=60", requests: 2, cacheStatus: "HIT", shared: true},
+		// s-maxage implies proxy-revalidate in a shared cache, but only once the
+		// response is stale; it remains an ordinary HIT during its fresh lifetime.
+		{cacheControl: "s-maxage=60", requests: 1, cacheStatus: "HIT", shared: true},
 		{cacheControl: "s-maxage=60", requests: 2, secondsElapsed: 65, shared: true},
 		{cacheControl: "max-age=60", requests: 1, cacheStatus: "HIT"},
 		{cacheControl: "max-age=60", requests: 1, secondsElapsed: 35, cacheStatus: "HIT"},
 		{cacheControl: "max-age=60", requests: 2, secondsElapsed: 65},
-		{cacheControl: "max-age=60, must-revalidate", requests: 2, cacheStatus: "HIT"},
+		{cacheControl: "max-age=60, must-revalidate", requests: 1, cacheStatus: "HIT"},
 		{cacheControl: "max-age=60, proxy-revalidate", requests: 1, cacheStatus: "HIT"},
-		{cacheControl: "max-age=60, proxy-revalidate", requests: 2, cacheStatus: "HIT", shared: true},
+		{cacheControl: "max-age=60, proxy-revalidate", requests: 1, cacheStatus: "HIT", shared: true},
 		{cacheControl: "private, max-age=60", requests: 1, cacheStatus: "HIT"},
 		{cacheControl: "private, max-age=60", requests: 2, cacheStatus: "SKIP", shared: true},
 	}
@@ -706,7 +708,12 @@ func TestSpecFresheningGetWithHeadRequest(t *testing.T) {
 	}
 }
 
-func TestSpecContentHeaderInRequestRespected(t *testing.T) {
+// TestSpecContentLocationInRequestIgnored: a request's Content-Location must
+// not select the cache entry. Honouring it let a client read (and, on a miss,
+// write) another URL's entry, which is a cross-URL content-confusion and
+// cache-poisoning primitive in a shared cache. RFC 7234 section 4.4 uses the
+// *response's* Content-Location, and only to invalidate — never to pick a key.
+func TestSpecContentLocationInRequestIgnored(t *testing.T) {
 	client, upstream := testSetup()
 	upstream.CacheControl = "max-age=3600"
 
@@ -714,16 +721,12 @@ func TestSpecContentHeaderInRequestRespected(t *testing.T) {
 	if strings.Compare("MISS", r1.cacheStatus) != 0 {
 		t.Fatalf("Cache status: %s not equal", r1.cacheStatus)
 	}
-	if strings.Compare(string(upstream.Body), string(r1.body)) != 0 {
-		t.Fatalf("Cache body: %s not equal", string(r1.body))
-	}
 
+	// A different URL naming /llamas/rock in Content-Location must not be
+	// served that entry.
 	r2 := client.get("/another/llamas", "Content-Location: /llamas/rock")
-	if strings.Compare("HIT", r2.cacheStatus) != 0 {
-		t.Fatalf("Cache status: %s not equal", r2.cacheStatus)
-	}
-	if strings.Compare(string(upstream.Body), string(r2.body)) != 0 {
-		t.Fatalf("Cache body: %s not equal", string(r2.body))
+	if strings.Compare("MISS", r2.cacheStatus) != 0 {
+		t.Fatalf("Content-Location in a request selected another URL's entry: got %s, want MISS", r2.cacheStatus)
 	}
 }
 
