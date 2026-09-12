@@ -209,32 +209,29 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			h.metrics.RecordCacheMiss(r.Method)
 		}
 		flight, leader := h.claimMiss(cReq.Key.String())
-		if !leader {
-			select {
-			case <-flight.done:
-				res, err = h.lookup(cReq)
-				if err == nil {
-					res.Header().Set(CacheHeader, "HIT")
-					if h.metrics != nil {
-						h.metrics.RecordCacheHit(r.Method)
-					}
-					h.serveResource(res, rw, cReq)
-					_ = res.Close()
-					return
-				}
+		if leader {
+			h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
+			return
+		}
+
+		select {
+		case <-flight.done:
+			res, err = h.lookup(cReq)
+			if err != nil {
 				// The leader could not cache the response. Fall through to an
 				// uncoupled upstream request so followers are never stranded.
 				h.passUpstream(rw, cReq, nil)
 				return
-			case <-r.Context().Done():
-				return
 			}
+			// Continue through the ordinary cache-hit path. Invalidation may
+			// race the leader's completed Store and mark this response stale
+			// before the follower wakes, so it must not bypass validation.
+		case <-r.Context().Done():
+			return
 		}
-		h.passUpstream(rw, cReq, func() { h.finishMiss(cReq.Key.String(), flight) })
-		return
-	} else {
-		h.debugf("%s %s found in %s cache", r.Method, r.URL.String(), cacheType)
 	}
+
+	h.debugf("%s %s found in %s cache", r.Method, r.URL.String(), cacheType)
 
 	if h.needsValidation(res, cReq) {
 		if cReq.CacheControl.Has("only-if-cached") {

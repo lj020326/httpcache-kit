@@ -27,6 +27,7 @@ func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
 	cache := NewMemoryCache()
 	log := logger.Default()
 	h := NewHandlerWithOptions(cache, upstream, &HandlerOptions{Logger: log})
+	t.Cleanup(func() { h.writes.Wait() })
 	if h == nil {
 		t.Fatal("handler is nil")
 	}
@@ -36,6 +37,9 @@ func TestNewHandlerWithOptions_WithLogger(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("code: %d", rec.Code)
 	}
+	// passUpstream deliberately persists the body asynchronously; wait before
+	// making the request whose purpose is to exercise the cache-hit path.
+	h.writes.Wait()
 	// Trigger logRef with IsDebugLogging so handler uses injected logger for debugf
 	prev := IsDebugLogging()
 	SetDebugLogging(true)
@@ -968,6 +972,68 @@ func TestConcurrentMissesAreCollapsed(t *testing.T) {
 		t.Fatalf("unexpected follower response: %q", err)
 	}
 	if got := calls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
+type missThenStaleCache struct {
+	Cache
+	retrieves atomic.Int32
+	first     chan struct{}
+}
+
+func (c *missThenStaleCache) Retrieve(string) (*Resource, error) {
+	if c.retrieves.Add(1) == 1 {
+		close(c.first)
+		return nil, ErrNotFoundInCache
+	}
+	res := NewResourceBytes(http.StatusOK, []byte("before"), http.Header{
+		"Cache-Control": {"max-age=3600"},
+	})
+	res.MarkStale()
+	return res, nil
+}
+
+func TestMissFollowerRevalidatesResultInvalidatedAfterLeaderStore(t *testing.T) {
+	cache := &missThenStaleCache{Cache: NewMemoryCache(), first: make(chan struct{})}
+	var upstreamCalls atomic.Int32
+	upstream := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Cache-Control", "max-age=60")
+		_, _ = w.Write([]byte("after"))
+	})
+	h := NewHandler(cache, upstream)
+	t.Cleanup(func() { h.writes.Wait() })
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.org/item", nil)
+	cReq, err := newCacheRequest(req)
+	if err != nil {
+		t.Fatalf("newCacheRequest: %v", err)
+	}
+	flight, leader := h.claimMiss(cReq.Key.String())
+	if !leader {
+		t.Fatal("failed to install the test's leader flight")
+	}
+
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(rec, req)
+	}()
+	<-cache.first
+
+	// The completed leader wakes the follower, whose second lookup observes a
+	// response invalidated between Store and wakeup. It must pass through the
+	// regular validation path rather than being served as an unconditional HIT.
+	h.finishMiss(cReq.Key.String(), flight)
+	<-done
+	h.writes.Wait()
+
+	if got := rec.Body.String(); got != "after" {
+		t.Fatalf("body = %q, want refreshed body after", got)
+	}
+	if got := upstreamCalls.Load(); got != 1 {
 		t.Fatalf("upstream calls = %d, want 1", got)
 	}
 }

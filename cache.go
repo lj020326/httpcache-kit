@@ -449,11 +449,20 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 		// cleared the base marker that every OTHER variant is still judged
 		// against. The cleanup goroutine expires markers on its own.
 		hashedKey := hashKey(key)
+		storedAt := Clock()
+		headerData, err := serializeStoredHeader(res.Status(), res.Header(), storedAt)
+		if err != nil {
+			return fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
+		}
 
 		// If Content-Length is known, make room before the write. Unknown-length
-		// streams are accounted for and evicted immediately after the write.
+		// streams are accounted for and evicted immediately after the write. The
+		// persisted header is part of the admission size too; excluding it lets
+		// otherwise equal replacements drift beyond MaxSize.
 		if hasExpectedSize {
-			c.evictIfNeeded(expectedSize)
+			if err := c.evictIfNeeded(hashedKey, expectedSize+int64(len(headerData))); err != nil {
+				return fmt.Errorf("failed to make room for key %q: %w", key, err)
+			}
 		}
 
 		var body io.Reader = res
@@ -470,12 +479,19 @@ func (c *cache) Store(res *Resource, keys ...string) error {
 			return fmt.Errorf("resource body for key %q was %d bytes, expected %d", key, written, expectedSize)
 		}
 		if !hasExpectedSize {
-			c.evictIfNeeded(written)
+			if err := c.evictIfNeeded(hashedKey, written+int64(len(headerData))); err != nil {
+				bodyPath := bodyPrefix + formatPrefix + hashedKey
+				if removeErr := c.fs.Remove(bodyPath); removeErr != nil && !vfs.IsNotExist(removeErr) {
+					err = errors.Join(err, fmt.Errorf("remove unadmitted body file %s: %w", bodyPath, removeErr))
+				}
+				return fmt.Errorf("failed to make room for key %q: %w", key, err)
+			}
 		}
 
-		storedAt := Clock()
-		headerBytes, err := c.storeHeader(res.Status(), res.Header(), key, storedAt)
+		headerBytes, err := c.storeSerializedHeader(headerData, key)
 		if err != nil {
+			bodyPath := bodyPrefix + formatPrefix + hashedKey
+			_ = c.fs.Remove(bodyPath)
 			return err
 		}
 
@@ -495,13 +511,25 @@ func (c *cache) storeBody(r io.Reader, key string) (int64, error) {
 }
 
 func (c *cache) storeHeader(code int, h http.Header, key string, storedAt time.Time) (int64, error) {
+	headerData, err := serializeStoredHeader(code, h, storedAt)
+	if err != nil {
+		return 0, fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
+	}
+	return c.storeSerializedHeader(headerData, key)
+}
+
+func serializeStoredHeader(code int, h http.Header, storedAt time.Time) ([]byte, error) {
 	hb := &bytes.Buffer{}
 	fmt.Fprintf(hb, "%s%s\r\n", storedAtPreamble, storedAt.UTC().Format(time.RFC3339Nano))
 	fmt.Fprintf(hb, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
 	if err := headersToWriter(h, hb); err != nil {
-		return 0, fmt.Errorf("failed to serialize headers for key %q: %w", key, err)
+		return nil, err
 	}
-	n, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(hb.Bytes()))
+	return hb.Bytes(), nil
+}
+
+func (c *cache) storeSerializedHeader(headerData []byte, key string) (int64, error) {
+	n, err := c.vfsWrite(headerPrefix+formatPrefix+hashKey(key), bytes.NewReader(headerData))
 	if err != nil {
 		return 0, fmt.Errorf("failed to store header for key %q: %w", key, err)
 	}
@@ -1004,40 +1032,64 @@ func (c *cache) removeEntry(entry *cacheEntry) error {
 	return nil
 }
 
-// evictIfNeeded evicts the least recently used items if cache size exceeds limit
-func (c *cache) evictIfNeeded(additionalSize int64) {
+// evictIfNeeded evicts enough least-recently-used items to admit itemSize.
+// It returns an error when removal failures leave insufficient room, so Store
+// never admits another item merely because the first LRU victim is stuck.
+func (c *cache) evictIfNeeded(hashedKey string, itemSize int64) error {
 	if c.config.MaxSize <= 0 {
-		return
+		return nil
+	}
+	if itemSize > c.config.MaxSize {
+		return fmt.Errorf("item size %d exceeds cache size limit %d", itemSize, c.config.MaxSize)
 	}
 
 	c.lruMutex.Lock()
 	defer c.lruMutex.Unlock()
 
-	targetSize := c.config.MaxSize - additionalSize
-	if targetSize < 0 {
-		targetSize = 0
+	// Replacing a key reclaims its old tracked size when trackEntry commits the
+	// new value. Protect that entry from eviction (important for an
+	// unknown-length body that has already overwritten its backing file) and
+	// reserve only the net space the replacement needs.
+	existingSize := int64(0)
+	if existing, ok := c.lruIndex[hashedKey]; ok {
+		existingSize = existing.size
 	}
+	targetSize := c.config.MaxSize - itemSize + existingSize
 
-	// Evict from the back (least recently used)
-	for c.totalSize > targetSize && c.lruList.Len() > 0 {
-		elem := c.lruList.Back()
-		if elem == nil {
-			break
-		}
+	var removeErr error
+	// Visit each entry at most once, from least to most recently used. A
+	// failed victim stays tracked for a later retry, but must not prevent us
+	// from reclaiming other removable entries during this admission attempt.
+	for elem := c.lruList.Back(); c.totalSize > targetSize && elem != nil; {
+		prev := elem.Prev()
 		entry := elem.Value.(*cacheEntry)
+		if entry.hashedKey == hashedKey {
+			elem = prev
+			continue
+		}
 		debugf("evicting LRU entry: %s (size: %d, accessed: %s)",
 			entry.key, entry.size, entry.accessedAt.Format(time.RFC3339))
 		if err := c.removeEntry(entry); err != nil {
-			// The oldest entry could not be removed, so this call cannot safely
-			// make additional room without potentially spinning on failures.
-			break
+			removeErr = errors.Join(removeErr, err)
+			elem = prev
+			continue
 		}
 
 		// Record eviction metric
 		if getDefaultMetrics() != nil {
 			getDefaultMetrics().RecordCacheEviction("lru")
 		}
+		elem = prev
 	}
+
+	if c.totalSize > targetSize {
+		err := fmt.Errorf("cache has %d bytes but must shrink to %d bytes before admission", c.totalSize, targetSize)
+		if removeErr != nil {
+			return errors.Join(err, removeErr)
+		}
+		return err
+	}
+	return nil
 }
 
 // Cleanup methods
@@ -1207,16 +1259,17 @@ func (c *cache) enforceMaxSize() (int, int64) {
 	removed := 0
 	var bytesRemoved int64
 
-	for c.totalSize > c.config.MaxSize && c.lruList.Len() > 0 {
-		elem := c.lruList.Back()
-		if elem == nil {
-			break
-		}
+	// A single undeletable oldest entry must not disable cleanup of every
+	// newer entry. Visit each candidate once and retain failed entries for a
+	// future retry.
+	for elem := c.lruList.Back(); c.totalSize > c.config.MaxSize && elem != nil; {
+		prev := elem.Prev()
 		entry := elem.Value.(*cacheEntry)
 		debugf("enforcing max size, removing: %s (size: %d)",
 			entry.key, entry.size)
 		if err := c.removeEntry(entry); err != nil {
-			break
+			elem = prev
+			continue
 		}
 		bytesRemoved += entry.size
 		removed++
@@ -1225,6 +1278,7 @@ func (c *cache) enforceMaxSize() (int, int64) {
 		if getDefaultMetrics() != nil {
 			getDefaultMetrics().RecordCacheEviction("size_limit")
 		}
+		elem = prev
 	}
 
 	return removed, bytesRemoved

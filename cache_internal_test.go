@@ -86,6 +86,18 @@ func (r *removeFailVFS) Remove(path string) error {
 	return r.VFS.Remove(path)
 }
 
+type selectiveRemoveFailVFS struct {
+	vfs.VFS
+	failHash string
+}
+
+func (r *selectiveRemoveFailVFS) Remove(path string) error {
+	if r.failHash != "" && strings.HasSuffix(path, "/"+r.failHash) {
+		return os.ErrPermission
+	}
+	return r.VFS.Remove(path)
+}
+
 func TestReadHeaders_Malformed(t *testing.T) {
 	// Malformed status line: "HTTP/1.1" only one part
 	r := bufio.NewReader(bytes.NewReader([]byte("HTTP/1.1\r\n\r\n")))
@@ -277,7 +289,7 @@ func TestStore_VfsWriteOpenFileFails(t *testing.T) {
 }
 
 func TestRemoveEntry_RemoveFails(t *testing.T) {
-	// When Remove fails (not IsNotExist), removeEntry still continues and hits debugf
+	// A real removal error is retained and prevents an over-limit admission.
 	config := DefaultCacheConfig().WithMaxSize(500).WithCleanupInterval(0)
 	c := NewVFSCacheWithConfig(&removeFailVFS{vfs.Memory()}, config).(*cache)
 	defer func() { _ = c.Close() }()
@@ -286,12 +298,82 @@ func TestRemoveEntry_RemoveFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	res2 := NewResourceBytes(200, []byte(strings.Repeat("y", 300)), http.Header{"Content-Length": []string{"300"}})
-	if err := c.Store(res2, "k2"); err != nil {
-		t.Fatal(err)
+	if err := c.Store(res2, "k2"); err == nil {
+		t.Fatal("Store(k2) succeeded despite the failed eviction")
 	}
-	// Eviction would call removeEntry; Remove fails but we continue
-	stats := c.Stats()
-	_ = stats
+	if stats := c.Stats(); stats.ItemCount != 1 || stats.TotalSize > config.MaxSize {
+		t.Fatalf("stats after rejected admission = %+v", stats)
+	}
+}
+
+func TestEvictionSkipsFailedVictimAndReclaimsAnotherEntry(t *testing.T) {
+	fs := &selectiveRemoveFailVFS{VFS: vfs.Memory()}
+	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig().WithMaxSize(1<<20).WithCleanupInterval(0)).(*cache)
+	defer func() { _ = c.Close() }()
+
+	store := func(key, body string) {
+		t.Helper()
+		res := NewResourceBytes(http.StatusOK, []byte(body), http.Header{
+			"Content-Length": {fmt.Sprint(len(body))},
+		})
+		if err := c.Store(res, key); err != nil {
+			t.Fatalf("Store(%q): %v", key, err)
+		}
+	}
+	body := strings.Repeat("x", 64)
+	store("stuck", body)
+	store("removable", body)
+
+	before := c.Stats()
+	// Leave enough slack for sub-second timestamp serialization to vary by a
+	// few bytes while still requiring one complete entry to be reclaimed.
+	c.config.MaxSize = before.TotalSize + 16
+	fs.failHash = hashKey("stuck")
+	store("new", body)
+
+	if got := c.Stats().TotalSize; got > c.config.MaxSize {
+		t.Fatalf("cache size = %d, exceeds limit %d", got, c.config.MaxSize)
+	}
+	if _, err := c.Retrieve("removable"); err != ErrNotFoundInCache {
+		t.Fatalf("removable entry error = %v, want ErrNotFoundInCache", err)
+	}
+	for _, key := range []string{"stuck", "new"} {
+		res, err := c.Retrieve(key)
+		if err != nil {
+			t.Fatalf("Retrieve(%q): %v", key, err)
+		}
+		_ = res.Close()
+	}
+}
+
+func TestStoreRejectsAdmissionWhenNoVictimCanBeRemoved(t *testing.T) {
+	fs := &selectiveRemoveFailVFS{VFS: vfs.Memory()}
+	c := NewVFSCacheWithConfig(fs, DefaultCacheConfig().WithMaxSize(1<<20).WithCleanupInterval(0)).(*cache)
+	defer func() { _ = c.Close() }()
+	body := strings.Repeat("x", 64)
+	first := NewResourceBytes(http.StatusOK, []byte(body), http.Header{
+		"Content-Length": {fmt.Sprint(len(body))},
+	})
+	if err := c.Store(first, "stuck"); err != nil {
+		t.Fatalf("Store(stuck): %v", err)
+	}
+
+	before := c.Stats()
+	c.config.MaxSize = before.TotalSize
+	fs.failHash = hashKey("stuck")
+	second := NewResourceBytes(http.StatusOK, []byte(body), http.Header{
+		"Content-Length": {fmt.Sprint(len(body))},
+	})
+	if err := c.Store(second, "rejected"); err == nil {
+		t.Fatal("Store(rejected) succeeded despite having no removable victim")
+	}
+	after := c.Stats()
+	if after.ItemCount != before.ItemCount || after.TotalSize != before.TotalSize {
+		t.Fatalf("failed admission changed stats: before=%+v after=%+v", before, after)
+	}
+	if _, err := c.Retrieve("rejected"); err != ErrNotFoundInCache {
+		t.Fatalf("rejected entry error = %v, want ErrNotFoundInCache", err)
+	}
 }
 
 func TestStore_NoContentLength(t *testing.T) {
@@ -583,23 +665,16 @@ func TestEvictIfNeeded_NoLimit(t *testing.T) {
 	}
 }
 
-func TestEvictIfNeeded_TargetSizeNegative(t *testing.T) {
-	// additionalSize > MaxSize -> targetSize = 0, then evict until totalSize <= 0
+func TestEvictIfNeeded_RejectsOversizedItem(t *testing.T) {
 	config := DefaultCacheConfig().WithMaxSize(30).WithCleanupInterval(0)
 	cache := NewMemoryCacheWithConfig(config).(*cache)
 	defer func() { _ = cache.Close() }()
 	res1 := NewResourceBytes(200, []byte("12"), http.Header{"Content-Length": []string{"2"}})
-	if err := cache.Store(res1, "k1"); err != nil {
-		t.Fatal(err)
+	if err := cache.Store(res1, "k1"); err == nil {
+		t.Fatal("oversized item was admitted")
 	}
-	res2 := NewResourceBytes(200, []byte("12345"), http.Header{"Content-Length": []string{"5"}})
-	if err := cache.Store(res2, "k2"); err != nil {
-		t.Fatal(err)
-	}
-	// Second Store triggers evictIfNeeded(5+header); totalSize was ~2+headers, now we add ~5+headers > 30, targetSize = 0
-	stats := cache.Stats()
-	if stats.ItemCount > 2 {
-		t.Errorf("eviction should have run, item count %d", stats.ItemCount)
+	if stats := cache.Stats(); stats.ItemCount != 0 || stats.TotalSize != 0 {
+		t.Fatalf("oversized admission changed stats: %+v", stats)
 	}
 }
 
@@ -608,13 +683,14 @@ func TestEvictIfNeeded_WithMetrics(t *testing.T) {
 	defer func() { SetDefaultMetrics(prev) }()
 	reg := metrics.NewRegistry("test_evict_metrics")
 	SetDefaultMetrics(NewCacheMetrics(reg))
-	config := DefaultCacheConfig().WithMaxSize(100).WithCleanupInterval(0)
+	config := DefaultCacheConfig().WithMaxSize(1 << 20).WithCleanupInterval(0)
 	cache := NewMemoryCacheWithConfig(config).(*cache)
 	defer func() { _ = cache.Close() }()
 	res1 := NewResourceBytes(200, []byte(strings.Repeat("x", 80)), http.Header{"Content-Length": []string{"80"}})
 	if err := cache.Store(res1, "k1"); err != nil {
 		t.Fatal(err)
 	}
+	config.MaxSize = cache.Stats().TotalSize + 16
 	res2 := NewResourceBytes(200, []byte(strings.Repeat("y", 80)), http.Header{"Content-Length": []string{"80"}})
 	if err := cache.Store(res2, "k2"); err != nil {
 		t.Fatal(err)
