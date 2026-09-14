@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/prometheus/client_golang v1.24.1
-	github.com/soulteary/logger-kit/v2 v2.2.0
+	github.com/soulteary/logger-kit/v2 v2.3.0
 	github.com/soulteary/metrics-kit/v2 v2.2.0
 	github.com/soulteary/vfs-kit v1.4.0
 )
