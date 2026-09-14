@@ -5,8 +5,8 @@ import (
 	"log"
 	"testing"
 
-	"github.com/soulteary/httpcache-kit/v2"
-	logger "github.com/soulteary/logger-kit/v2"
+	"github.com/lj020326/httpcache-kit/v2"
+	logger "github.com/lj020326/logger-kit/v2"
 )
 
 func TestSetLogger(t *testing.T) {

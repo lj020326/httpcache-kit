@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	logger "github.com/soulteary/logger-kit/v2"
-	metrics "github.com/soulteary/metrics-kit/v2"
+	logger "github.com/lj020326/logger-kit/v2"
+	metrics "github.com/lj020326/metrics-kit/v2"
 )
 
 func TestNewHandlerWithOptions_WithLogger(t *testing.T) {

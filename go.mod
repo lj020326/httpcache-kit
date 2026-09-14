@@ -1,4 +1,4 @@
-module github.com/soulteary/httpcache-kit/v2
+module github.com/lj020326/httpcache-kit/v2
 
 go 1.27.0
 

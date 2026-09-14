@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	metrics "github.com/soulteary/metrics-kit/v2"
-	"github.com/soulteary/vfs-kit"
+	metrics "github.com/lj020326/metrics-kit/v2"
+	"github.com/lj020326/vfs-kit"
 )
 
 func TestCache_Header_OpenError(t *testing.T) {

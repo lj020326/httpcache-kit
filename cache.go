@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/soulteary/vfs-kit"
+	"github.com/lj020326/vfs-kit"
 )
 
 // hash64Pool reuses FNV-1a 64-bit hashers to reduce allocations in hashKey.

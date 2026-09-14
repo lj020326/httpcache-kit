@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/soulteary/vfs-kit"
+	"github.com/lj020326/vfs-kit"
 )
 
 type blockingHeaderOpenVFS struct {

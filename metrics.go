@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
-	metrics "github.com/soulteary/metrics-kit/v2"
+	metrics "github.com/lj020326/metrics-kit/v2"
 )
 
 // CacheMetrics holds Prometheus metrics for cache operations
